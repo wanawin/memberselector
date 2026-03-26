@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# core025_member_engine_v2__2026-03-26.py
+# core025_member_engine_v2__2026-03-26_FIXED.py
 
 import pandas as pd
 import numpy as np
@@ -18,7 +18,8 @@ def norm(r):
     return "".join(d[:4]) if len(d)>=4 else None
 
 def to_member(r):
-    if r is None: return None
+    if r is None:
+        return None
     s = "".join(sorted(r))
     return s if s in CORE025 else None
 
@@ -32,11 +33,20 @@ def load(f):
         return pd.read_excel(f)
 
 # -----------------------
-# Feature builder
+# Feature builder (SAFE)
 # -----------------------
 
 def features(seed):
-    d = [int(x) for x in seed]
+    if seed is None:
+        return None
+
+    d = re.findall(r"\d", str(seed))
+
+    if len(d) < 4:
+        return None
+
+    d = [int(x) for x in d[:4]]
+
     return {
         "sum": sum(d),
         "spread": max(d)-min(d),
@@ -63,9 +73,14 @@ def prep(df):
     df["member"]=df["r4"].apply(to_member)
     df["stream"]=df["jurisdiction"].astype(str)+"|"+df["game"].astype(str)
 
-    df=df.dropna(subset=["r4"]).reset_index(drop=True)
+    df = df.dropna(subset=["r4"]).reset_index(drop=True)
 
-    feats = df["r4"].apply(features).apply(pd.Series)
+    feats = df["r4"].apply(features)
+    feats = feats.dropna().apply(pd.Series)
+
+    df = df.loc[feats.index].reset_index(drop=True)
+    feats = feats.reset_index(drop=True)
+
     return pd.concat([df,feats],axis=1)
 
 # -----------------------
@@ -77,11 +92,19 @@ def build_transitions(df):
     for s,g in df.groupby("stream"):
         g=g.sort_values("date").reset_index(drop=True)
         for i in range(1,len(g)):
+            seed = g.loc[i-1,"r4"]
+            member = g.loc[i,"member"]
+
+            f = features(seed)
+            if f is None:
+                continue
+
             rows.append({
-                "seed":g.loc[i-1,"r4"],
-                "next_member":g.loc[i,"member"],
-                **features(g.loc[i-1,"r4"])
+                "seed": seed,
+                "next_member": member,
+                **f
             })
+
     return pd.DataFrame(rows)
 
 # -----------------------
@@ -102,18 +125,20 @@ def similarity(a,b):
     if a["unique"]==b["unique"]: score+=1
     if a["pair"]==b["pair"]: score+=1
 
-    # position weighting
     if a["pos1"]==b["pos1"]: score+=1
     if a["pos2"]==b["pos2"]: score+=1
 
     return score
 
 # -----------------------
-# Score seed
+# Score seed (SAFE)
 # -----------------------
 
 def score_seed(seed, transitions):
     seed_feat = features(seed)
+
+    if seed_feat is None:
+        return [(m,1/3) for m in CORE025]
 
     scores = {m:0 for m in CORE025}
     total_weight = 0
@@ -137,7 +162,7 @@ def score_seed(seed, transitions):
     return ranked
 
 # -----------------------
-# Apply to survivors
+# Apply to survivors (SAFE)
 # -----------------------
 
 def apply_survivors(surv, transitions):
@@ -177,6 +202,10 @@ def app():
     hist = prep(load(hist_file))
     surv = load(surv_file)
 
+    # -------- CLEAN SURVIVORS --------
+    surv = surv[surv["seed"].notna()]
+    surv = surv[surv["seed"].astype(str).str.len() >= 4]
+
     if "stream_id" in surv.columns:
         surv["stream"] = surv["stream_id"]
 
@@ -192,6 +221,8 @@ def app():
         results.to_csv(index=False),
         "member_rankings_v2.csv"
     )
+
+# -----------------------
 
 if __name__=="__main__":
     app()
