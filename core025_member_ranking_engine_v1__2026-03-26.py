@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# core025_member_ranking_engine_v1__2026-03-26.py
+# core025_member_engine_v2__2026-03-26.py
 
 import pandas as pd
 import numpy as np
 import re
 import streamlit as st
-from collections import Counter, defaultdict
+from collections import Counter
 
 CORE025 = ["0025","0225","0255"]
 
@@ -32,6 +32,25 @@ def load(f):
         return pd.read_excel(f)
 
 # -----------------------
+# Feature builder
+# -----------------------
+
+def features(seed):
+    d = [int(x) for x in seed]
+    return {
+        "sum": sum(d),
+        "spread": max(d)-min(d),
+        "even": sum(x%2==0 for x in d),
+        "high": sum(x>=5 for x in d),
+        "unique": len(set(d)),
+        "pair": int(len(set(d))<4),
+        "pos1": d[0],
+        "pos2": d[1],
+        "pos3": d[2],
+        "pos4": d[3],
+    }
+
+# -----------------------
 # Prepare history
 # -----------------------
 
@@ -44,10 +63,13 @@ def prep(df):
     df["member"]=df["r4"].apply(to_member)
     df["stream"]=df["jurisdiction"].astype(str)+"|"+df["game"].astype(str)
 
-    return df.dropna(subset=["r4"]).reset_index(drop=True)
+    df=df.dropna(subset=["r4"]).reset_index(drop=True)
+
+    feats = df["r4"].apply(features).apply(pd.Series)
+    return pd.concat([df,feats],axis=1)
 
 # -----------------------
-# Build transition table
+# Build transitions
 # -----------------------
 
 def build_transitions(df):
@@ -56,47 +78,61 @@ def build_transitions(df):
         g=g.sort_values("date").reset_index(drop=True)
         for i in range(1,len(g)):
             rows.append({
-                "stream":s,
                 "seed":g.loc[i-1,"r4"],
-                "next_member":g.loc[i,"member"]
+                "next_member":g.loc[i,"member"],
+                **features(g.loc[i-1,"r4"])
             })
     return pd.DataFrame(rows)
 
 # -----------------------
-# Build probability model
+# Similarity scoring
 # -----------------------
 
-def build_model(tr):
-    model = defaultdict(lambda: Counter())
+def similarity(a,b):
+    score=0
 
-    for _,r in tr.iterrows():
-        if r["next_member"] is not None:
-            model[r["seed"]][r["next_member"]] += 1
+    if a["sum"]==b["sum"]: score+=2
+    if abs(a["sum"]-b["sum"])<=2: score+=1
 
-    return model
+    if a["spread"]==b["spread"]: score+=2
+    if abs(a["spread"]-b["spread"])<=1: score+=1
+
+    if a["even"]==b["even"]: score+=1
+    if a["high"]==b["high"]: score+=1
+    if a["unique"]==b["unique"]: score+=1
+    if a["pair"]==b["pair"]: score+=1
+
+    # position weighting
+    if a["pos1"]==b["pos1"]: score+=1
+    if a["pos2"]==b["pos2"]: score+=1
+
+    return score
 
 # -----------------------
-# Score a seed
+# Score seed
 # -----------------------
 
-def score_seed(seed, model):
-    counts = model.get(seed, Counter())
+def score_seed(seed, transitions):
+    seed_feat = features(seed)
 
-    total = sum(counts.values())
+    scores = {m:0 for m in CORE025}
+    total_weight = 0
 
-    scores = {}
-    for m in CORE025:
-        if total > 0:
-            scores[m] = counts[m] / total
-        else:
-            scores[m] = 0.0
+    for _,r in transitions.iterrows():
+        if r["next_member"] is None:
+            continue
 
-    # fallback: if unseen seed
-    if total == 0:
-        for m in CORE025:
-            scores[m] = 1/3
+        sim = similarity(seed_feat, r)
 
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        if sim > 0:
+            scores[r["next_member"]] += sim
+            total_weight += sim
+
+    if total_weight == 0:
+        return [(m,1/3) for m in CORE025]
+
+    probs = {m: scores[m]/total_weight for m in CORE025}
+    ranked = sorted(probs.items(), key=lambda x:x[1], reverse=True)
 
     return ranked
 
@@ -104,16 +140,16 @@ def score_seed(seed, model):
 # Apply to survivors
 # -----------------------
 
-def apply_survivors(survivors, model):
+def apply_survivors(surv, transitions):
     rows=[]
 
-    for _,r in survivors.iterrows():
-        seed = r["seed"]
+    for _,r in surv.iterrows():
+        seed = str(r["seed"])
 
-        ranked = score_seed(seed, model)
+        ranked = score_seed(seed, transitions)
 
         rows.append({
-            "stream": r["stream_id"] if "stream_id" in r else r["stream"],
+            "stream": r.get("stream_id", r.get("stream")),
             "seed": seed,
             "Top1": ranked[0][0],
             "Top1_score": ranked[0][1],
@@ -130,36 +166,31 @@ def apply_survivors(survivors, model):
 # -----------------------
 
 def app():
-    st.title("Member Ranking Engine v1")
+    st.title("Member Ranking Engine v2 (Trait-Based)")
 
-    history_file = st.file_uploader("Upload FULL history file")
-    survivor_file = st.file_uploader("Upload PLAY survivors (from skip ladder)")
+    hist_file = st.file_uploader("Upload FULL history file")
+    surv_file = st.file_uploader("Upload PLAY survivors")
 
-    if not history_file or not survivor_file:
+    if not hist_file or not surv_file:
         return
 
-    hist = prep(load(history_file))
-    surv = load(survivor_file)
+    hist = prep(load(hist_file))
+    surv = load(surv_file)
 
-    # normalize survivor format
     if "stream_id" in surv.columns:
         surv["stream"] = surv["stream_id"]
-    if "seed" not in surv.columns:
-        st.error("Survivor file must contain 'seed'")
-        return
 
-    tr = build_transitions(hist)
-    model = build_model(tr)
+    transitions = build_transitions(hist)
 
-    results = apply_survivors(surv, model)
+    results = apply_survivors(surv, transitions)
 
-    st.subheader("Member Rankings")
+    st.subheader("Member Rankings v2")
     st.dataframe(results)
 
     st.download_button(
         "Download rankings",
         results.to_csv(index=False),
-        "member_rankings.csv"
+        "member_rankings_v2.csv"
     )
 
 if __name__=="__main__":
