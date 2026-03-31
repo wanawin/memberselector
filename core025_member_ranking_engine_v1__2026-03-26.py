@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# core025_separator_engine_plus_lab_walkforward__2026-03-31.py
+# core025_separator_engine_plus_lab_walkforward__2026-03-31_v2.py
 #
-# BUILD: core025_separator_engine_plus_lab_walkforward__2026-03-31
+# BUILD: core025_separator_engine_plus_lab_walkforward__2026-03-31_v2
 #
 # Full file. No placeholders.
 #
@@ -11,25 +11,26 @@
 # 1) Regular Run mode for current survivor playlist ranking
 # 2) Optional LAB mode for full no-lookahead walk-forward validation
 #
-# This file preserves the calibrated separator behavior and adds a full LAB path
-# without removing the regular run workflow.
+# This version corrects LAB scoring so that validation is performed only on
+# true Core025 winner events (0025 / 0225 / 0255). Non-Core025 transitions are
+# still used to build history maps incrementally, but they are excluded from the
+# scored LAB event set.
 #
 # Outputs
 # -------
 # Regular Run:
-# - core025_separator_ranked_playlist__2026-03-31.csv
-# - core025_separator_summary__2026-03-31.csv
+# - core025_separator_ranked_playlist__2026-03-31_v2.csv
+# - core025_separator_summary__2026-03-31_v2.csv
 #
 # LAB Walk-Forward:
-# - core025_lab_per_event__2026-03-31.csv
-# - core025_lab_per_date__2026-03-31.csv
-# - core025_lab_per_stream__2026-03-31.csv
-# - core025_lab_summary__2026-03-31.csv
+# - core025_lab_per_event__2026-03-31_v2.csv
+# - core025_lab_per_date__2026-03-31_v2.csv
+# - core025_lab_per_stream__2026-03-31_v2.csv
+# - core025_lab_summary__2026-03-31_v2.csv
 
 from __future__ import annotations
 
 import io
-import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -39,7 +40,7 @@ import pandas as pd
 import streamlit as st
 
 CORE025 = ["0025", "0225", "0255"]
-BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-03-31"
+BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-03-31_v2"
 DEFAULT_SKIP_SCORE_CUTOFF = 0.515465
 
 
@@ -782,10 +783,18 @@ def summarize_playlist(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def summarize_lab(per_event: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def summarize_lab(per_event: pd.DataFrame, total_transitions_seen: int, non_core025_transitions_skipped: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if len(per_event) == 0:
+        summary = pd.DataFrame(
+            [
+                {"metric": "events", "value": 0},
+                {"metric": "total_transitions_seen", "value": int(total_transitions_seen)},
+                {"metric": "non_core025_transitions_skipped", "value": int(non_core025_transitions_skipped)},
+                {"metric": "skip_score_cutoff_reference", "value": float(DEFAULT_SKIP_SCORE_CUTOFF)},
+            ]
+        )
         empty = pd.DataFrame()
-        return empty, empty, empty, pd.DataFrame(columns=["metric", "value"])
+        return empty, empty, empty, summary
 
     per_date = (
         per_event.groupby("transition_date", dropna=False)
@@ -848,8 +857,9 @@ def summarize_lab(per_event: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, 
     )
 
     summary_rows = []
-    total = len(per_event)
-    summary_rows.append({"metric": "events", "value": total})
+    summary_rows.append({"metric": "events", "value": int(len(per_event))})
+    summary_rows.append({"metric": "total_transitions_seen", "value": int(total_transitions_seen)})
+    summary_rows.append({"metric": "non_core025_transitions_skipped", "value": int(non_core025_transitions_skipped)})
     summary_rows.append({"metric": "top1_capture", "value": int(per_event["top1_hit"].sum())})
     summary_rows.append({"metric": "top2_capture", "value": int(per_event["top2_hit"].sum())})
     summary_rows.append({"metric": "top3_capture", "value": int(per_event["top3_hit"].sum())})
@@ -930,13 +940,28 @@ def run_lab_walkforward(
     transitions = build_transitions(hist)
     if len(transitions) == 0:
         empty = pd.DataFrame()
-        return empty, empty, empty, empty, pd.DataFrame(columns=["metric", "value"])
+        summary = pd.DataFrame(
+            [
+                {"metric": "events", "value": 0},
+                {"metric": "total_transitions_seen", "value": 0},
+                {"metric": "non_core025_transitions_skipped", "value": 0},
+                {"metric": "skip_score_cutoff_reference", "value": float(DEFAULT_SKIP_SCORE_CUTOFF)},
+            ]
+        )
+        return empty, empty, empty, empty, summary
 
     maps = init_baseline_maps()
     rows = []
     total = len(transitions)
+    total_transitions_seen = 0
+    non_core025_transitions_skipped = 0
 
     for idx, (_, row) in enumerate(transitions.iterrows(), start=1):
+        total_transitions_seen += 1
+        winner_member = normalize_member_code(row["next_member"])
+
+        # Always learn from the historical transition after it has passed,
+        # even if it is not a Core025 winner event.
         ranked = rank_members_from_maps(
             row=row,
             maps=maps,
@@ -961,11 +986,16 @@ def run_lab_walkforward(
             min_boost_margin_for_dominance=float(params["min_boost_margin_for_dominance"]),
         )
 
-        winner_member = normalize_member_code(row["next_member"])
+        if winner_member is None:
+            non_core025_transitions_skipped += 1
+            add_transition_to_maps(maps, row)
+            if progress_bar is not None:
+                progress_bar.progress(idx / total)
+            continue
+
         top1_hit = int(ranked["Top1"] == winner_member)
         top2_hit = int((ranked["Top1"] == winner_member) or (ranked["Top2"] == winner_member))
         top3_hit = int((ranked["Top1"] == winner_member) or (ranked["Top2"] == winner_member) or (ranked["Top3"] == winner_member))
-        play_rule_hit = 0
         if ranked["play_mode"] == "PLAY_TOP1":
             play_rule_hit = int(ranked["Top1"] == winner_member)
         elif ranked["play_mode"] == "PLAY_TOP2":
@@ -997,7 +1027,11 @@ def run_lab_walkforward(
             progress_bar.progress(idx / total)
 
     per_event = pd.DataFrame(rows).sort_values(["event_id"]).reset_index(drop=True)
-    per_date, per_stream, by_mode, summary = summarize_lab(per_event)
+    per_date, per_stream, by_mode, summary = summarize_lab(
+        per_event=per_event,
+        total_transitions_seen=total_transitions_seen,
+        non_core025_transitions_skipped=non_core025_transitions_skipped,
+    )
     return per_event, per_date, per_stream, by_mode, summary
 
 
@@ -1104,15 +1138,15 @@ def render_regular_results(out: pd.DataFrame, summary: pd.DataFrame, rows_to_sho
     st.dataframe(out[present_cols].head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_separator_ranked_playlist__2026-03-31.csv",
+        "Download core025_separator_ranked_playlist__2026-03-31_v2.csv",
         data=out.to_csv(index=False),
-        file_name="core025_separator_ranked_playlist__2026-03-31.csv",
+        file_name="core025_separator_ranked_playlist__2026-03-31_v2.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_separator_summary__2026-03-31.csv",
+        "Download core025_separator_summary__2026-03-31_v2.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_separator_summary__2026-03-31.csv",
+        file_name="core025_separator_summary__2026-03-31_v2.csv",
         mime="text/csv",
     )
 
@@ -1134,27 +1168,27 @@ def render_lab_results(per_event: pd.DataFrame, per_date: pd.DataFrame, per_stre
     st.dataframe(per_stream.head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_lab_per_event__2026-03-31.csv",
+        "Download core025_lab_per_event__2026-03-31_v2.csv",
         data=per_event.to_csv(index=False),
-        file_name="core025_lab_per_event__2026-03-31.csv",
+        file_name="core025_lab_per_event__2026-03-31_v2.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_per_date__2026-03-31.csv",
+        "Download core025_lab_per_date__2026-03-31_v2.csv",
         data=per_date.to_csv(index=False),
-        file_name="core025_lab_per_date__2026-03-31.csv",
+        file_name="core025_lab_per_date__2026-03-31_v2.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_per_stream__2026-03-31.csv",
+        "Download core025_lab_per_stream__2026-03-31_v2.csv",
         data=per_stream.to_csv(index=False),
-        file_name="core025_lab_per_stream__2026-03-31.csv",
+        file_name="core025_lab_per_stream__2026-03-31_v2.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_summary__2026-03-31.csv",
+        "Download core025_lab_summary__2026-03-31_v2.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_lab_summary__2026-03-31.csv",
+        file_name="core025_lab_summary__2026-03-31_v2.csv",
         mime="text/csv",
     )
 
@@ -1219,7 +1253,9 @@ def main():
                 progress.empty()
                 if lab_max_events > 0:
                     per_event = per_event.head(lab_max_events).copy()
-                    per_date, per_stream, by_mode, summary = summarize_lab(per_event)
+                    non_core = int(summary.loc[summary["metric"] == "non_core025_transitions_skipped", "value"].iloc[0]) if not summary.empty and (summary["metric"] == "non_core025_transitions_skipped").any() else 0
+                    total_seen = int(summary.loc[summary["metric"] == "total_transitions_seen", "value"].iloc[0]) if not summary.empty and (summary["metric"] == "total_transitions_seen").any() else 0
+                    per_date, per_stream, by_mode, summary = summarize_lab(per_event, total_seen, non_core)
                 st.session_state["core025_lab_per_event"] = per_event
                 st.session_state["core025_lab_per_date"] = per_date
                 st.session_state["core025_lab_per_stream"] = per_stream
