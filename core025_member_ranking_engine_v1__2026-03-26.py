@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-# core025_separator_ranking_engine_v2_dominance_rulenorm_calibrated__2026-03-31.py
+# core025_separator_engine_plus_lab_walkforward__2026-03-31.py
 #
-# BUILD: core025_separator_ranking_engine_v2_dominance_rulenorm_calibrated__2026-03-31
+# BUILD: core025_separator_engine_plus_lab_walkforward__2026-03-31
 #
 # Full file. No placeholders.
 #
 # Purpose
 # -------
-# Dominance-aware separator ranking engine for Core025 with:
-# - scaling fix
-# - rule-count normalization
-# - diminishing returns
-# - cross-member compression
-# - dominance calibration based on score separation + rule quality
-# - play-mode decisions
+# Unified Core025 separator app with:
+# 1) Regular Run mode for current survivor playlist ranking
+# 2) Optional LAB mode for full no-lookahead walk-forward validation
+#
+# This file preserves the calibrated separator behavior and adds a full LAB path
+# without removing the regular run workflow.
 #
 # Outputs
 # -------
-# - core025_separator_ranked_playlist_v2_dominance_rulenorm_calibrated__2026-03-31.csv
-# - core025_separator_dominance_summary_v2_rulenorm_calibrated__2026-03-31.csv
+# Regular Run:
+# - core025_separator_ranked_playlist__2026-03-31.csv
+# - core025_separator_summary__2026-03-31.csv
+#
+# LAB Walk-Forward:
+# - core025_lab_per_event__2026-03-31.csv
+# - core025_lab_per_date__2026-03-31.csv
+# - core025_lab_per_stream__2026-03-31.csv
+# - core025_lab_summary__2026-03-31.csv
 
 from __future__ import annotations
 
@@ -26,14 +32,20 @@ import io
 import math
 import re
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 CORE025 = ["0025", "0225", "0255"]
-BUILD_MARKER = "BUILD: core025_separator_ranking_engine_v2_dominance_rulenorm_calibrated__2026-03-31"
+BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-03-31"
+DEFAULT_SKIP_SCORE_CUTOFF = 0.515465
 
+
+# -----------------------------------------------------------------------------
+# Basic IO / normalization helpers
+# -----------------------------------------------------------------------------
 
 def load_table(f) -> pd.DataFrame:
     name = f.name.lower()
@@ -89,6 +101,10 @@ def normalize_scalar(x: object) -> str:
     return str(x).strip()
 
 
+# -----------------------------------------------------------------------------
+# Feature engineering
+# -----------------------------------------------------------------------------
+
 def sum_bucket(x: int) -> str:
     if x <= 9:
         return "sum_00_09"
@@ -143,10 +159,12 @@ def features(seed: object) -> Optional[Dict[str, object]]:
     digs = [int(x) for x in d[:4]]
     cnt = Counter(digs)
     unique_sorted = sorted(set(digs))
+
     consec_links = 0
     for a, b in zip(unique_sorted[:-1], unique_sorted[1:]):
         if b - a == 1:
             consec_links += 1
+
     s = sum(digs)
     spread = max(digs) - min(digs)
     feat = {
@@ -175,6 +193,10 @@ def features(seed: object) -> Optional[Dict[str, object]]:
         feat[f"cnt{k}"] = int(cnt.get(k, 0))
     return feat
 
+
+# -----------------------------------------------------------------------------
+# Data prep
+# -----------------------------------------------------------------------------
 
 def prep_history(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -250,18 +272,26 @@ def build_transitions(df: pd.DataFrame) -> pd.DataFrame:
             feat = features(seed)
             if feat is None:
                 continue
-            rows.append({
-                "stream": stream,
-                "seed": seed,
-                "seed_date": g.loc[i - 1, "date"],
-                "transition_date": g.loc[i, "date"],
-                "next_member": next_member,
-                **feat,
-            })
+            rows.append(
+                {
+                    "stream": stream,
+                    "seed": seed,
+                    "seed_date": g.loc[i - 1, "date"],
+                    "transition_date": g.loc[i, "date"],
+                    "next_member": next_member,
+                    **feat,
+                }
+            )
     if not rows:
         return pd.DataFrame(columns=["stream", "seed", "seed_date", "transition_date", "next_member"])
-    return pd.DataFrame(rows).sort_values(["transition_date", "stream", "seed"]).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(["transition_date", "stream", "seed"]).reset_index(drop=True)
+    out["event_id"] = range(1, len(out) + 1)
+    return out
 
+
+# -----------------------------------------------------------------------------
+# Baseline maps and incremental scorer
+# -----------------------------------------------------------------------------
 
 def counter_to_probs(c: Counter) -> Dict[str, float]:
     total = sum(c.values())
@@ -270,48 +300,77 @@ def counter_to_probs(c: Counter) -> Dict[str, float]:
     return {m: c.get(m, 0) / total for m in CORE025}
 
 
-def build_baseline_maps(transitions: pd.DataFrame):
-    exact_seed_map = defaultdict(Counter)
-    sorted_seed_map = defaultdict(Counter)
-    stream_member_map = defaultdict(Counter)
-    global_member_map = Counter()
-    for _, r in transitions.iterrows():
-        member = r["next_member"]
-        if member is None or pd.isna(member):
-            continue
-        exact_seed_map[str(r["seed"])][member] += 1
-        sorted_seed_map[str(r["sorted_seed"])][member] += 1
-        stream_member_map[str(r["stream"])][member] += 1
-        global_member_map[member] += 1
-    return exact_seed_map, sorted_seed_map, stream_member_map, global_member_map
+@dataclass
+class BaselineMaps:
+    exact_seed_map: Dict[str, Counter]
+    sorted_seed_map: Dict[str, Counter]
+    stream_member_map: Dict[str, Counter]
+    global_member_map: Counter
 
 
-def baseline_scores(seed_row: pd.Series, transitions: pd.DataFrame, min_stream_history: int = 20) -> Dict[str, float]:
-    exact_seed_map, sorted_seed_map, stream_member_map, global_member_map = build_baseline_maps(transitions)
+def init_baseline_maps() -> BaselineMaps:
+    return BaselineMaps(
+        exact_seed_map=defaultdict(Counter),
+        sorted_seed_map=defaultdict(Counter),
+        stream_member_map=defaultdict(Counter),
+        global_member_map=Counter(),
+    )
+
+
+def add_transition_to_maps(maps: BaselineMaps, row: pd.Series) -> None:
+    member = normalize_member_code(row.get("next_member"))
+    if member is None:
+        return
+    seed = str(row["seed"])
+    stream = str(row["stream"])
+    sorted_seed = str(row["sorted_seed"])
+    maps.exact_seed_map[seed][member] += 1
+    maps.sorted_seed_map[sorted_seed][member] += 1
+    maps.stream_member_map[stream][member] += 1
+    maps.global_member_map[member] += 1
+
+
+def baseline_scores_from_maps(seed_row: pd.Series, maps: BaselineMaps, min_stream_history: int = 20) -> Dict[str, float]:
     seed = str(seed_row["seed"])
     stream = str(seed_row["stream"])
     score_accum = {m: 0.0 for m in CORE025}
-    global_probs = counter_to_probs(global_member_map)
+
+    global_probs = counter_to_probs(maps.global_member_map)
     for m in CORE025:
         score_accum[m] += global_probs[m] * 0.25
-    if stream is not None and sum(stream_member_map[str(stream)].values()) >= int(min_stream_history):
-        stream_probs = counter_to_probs(stream_member_map[str(stream)])
+
+    if stream is not None and sum(maps.stream_member_map[stream].values()) >= int(min_stream_history):
+        stream_probs = counter_to_probs(maps.stream_member_map[stream])
         for m in CORE025:
             score_accum[m] += stream_probs[m] * 1.20
-    if seed in exact_seed_map and sum(exact_seed_map[seed].values()) > 0:
-        exact_probs = counter_to_probs(exact_seed_map[seed])
+
+    if seed in maps.exact_seed_map and sum(maps.exact_seed_map[seed].values()) > 0:
+        exact_probs = counter_to_probs(maps.exact_seed_map[seed])
         for m in CORE025:
             score_accum[m] += exact_probs[m] * 1.50
+
     sorted_key = str(seed_row["sorted_seed"])
-    if sorted_key in sorted_seed_map and sum(sorted_seed_map[sorted_key].values()) > 0:
-        sorted_probs = counter_to_probs(sorted_seed_map[sorted_key])
+    if sorted_key in maps.sorted_seed_map and sum(maps.sorted_seed_map[sorted_key].values()) > 0:
+        sorted_probs = counter_to_probs(maps.sorted_seed_map[sorted_key])
         for m in CORE025:
             score_accum[m] += sorted_probs[m] * 1.10
+
     total = sum(score_accum.values())
     if total <= 0:
         return {m: 1 / 3 for m in CORE025}
     return {m: score_accum[m] / total for m in CORE025}
 
+
+def build_maps_from_transitions(transitions: pd.DataFrame) -> BaselineMaps:
+    maps = init_baseline_maps()
+    for _, row in transitions.iterrows():
+        add_transition_to_maps(maps, row)
+    return maps
+
+
+# -----------------------------------------------------------------------------
+# Separator library
+# -----------------------------------------------------------------------------
 
 def parse_trait_stack(stack_text: str) -> List[Tuple[str, str]]:
     parts = [p.strip() for p in str(stack_text).split("&&") if p.strip()]
@@ -329,6 +388,7 @@ def load_separator_library(df: pd.DataFrame) -> List[Dict[str, object]]:
     missing = req - set(df.columns)
     if missing:
         raise ValueError(f"Separator library missing required columns: {sorted(missing)}")
+
     rules: List[Dict[str, object]] = []
     for idx, r in df.iterrows():
         stack = parse_trait_stack(str(r["trait_stack"]))
@@ -337,17 +397,19 @@ def load_separator_library(df: pd.DataFrame) -> List[Dict[str, object]]:
         winner_norm = normalize_member_code(r["winner_member"])
         if winner_norm is None:
             continue
-        rules.append({
-            "rule_id": idx + 1,
-            "pair": str(r["pair"]),
-            "trait_stack": str(r["trait_stack"]),
-            "conditions": stack,
-            "winner_member": winner_norm,
-            "winner_rate": float(r["winner_rate"]),
-            "pair_gap": float(r["pair_gap"]),
-            "support": int(r["support"]),
-            "stack_size": int(r["stack_size"]),
-        })
+        rules.append(
+            {
+                "rule_id": idx + 1,
+                "pair": str(r["pair"]),
+                "trait_stack": str(r["trait_stack"]),
+                "conditions": stack,
+                "winner_member": winner_norm,
+                "winner_rate": float(r["winner_rate"]),
+                "pair_gap": float(r["pair_gap"]),
+                "support": int(r["support"]),
+                "stack_size": int(r["stack_size"]),
+            }
+        )
     return rules
 
 
@@ -366,6 +428,10 @@ def match_rule(row: pd.Series, rule: Dict[str, object]) -> Tuple[bool, int, int,
             failed_cols.append(f"{col}:{cur}!={val}")
     return matched == total, matched, total, failed_cols
 
+
+# -----------------------------------------------------------------------------
+# Separator scoring and calibrated dominance logic
+# -----------------------------------------------------------------------------
 
 def apply_separator_rules(
     row: pd.Series,
@@ -398,7 +464,6 @@ def apply_separator_rules(
             raw_score += 0.03 * max(rule["stack_size"] - 1, 0)
             raw_score = min(raw_score, float(per_rule_cap))
 
-            # First-stage normalization: within-member diminishing returns.
             diminishing_scale = 1.0 / (1.0 + fired_counts[winner] * float(diminishing_return_factor))
             count_norm_scale = 1.0 / (1.0 + fired_counts[winner] * float(rule_count_norm_factor))
             scaled_score = raw_score * diminishing_scale * count_norm_scale
@@ -415,18 +480,20 @@ def apply_separator_rules(
             for fc in failed_cols:
                 fail_counter[fc.split(":")[0]] += 1
             if matched > 0:
-                near_misses.append({
-                    "rule_id": rule["rule_id"],
-                    "pair": rule["pair"],
-                    "trait_stack": rule["trait_stack"],
-                    "winner_member": rule["winner_member"],
-                    "matched_conditions": matched,
-                    "total_conditions": total,
-                    "failed_cols": " | ".join(failed_cols[:10]),
-                    "winner_rate": rule["winner_rate"],
-                    "pair_gap": rule["pair_gap"],
-                    "support": rule["support"],
-                })
+                near_misses.append(
+                    {
+                        "rule_id": rule["rule_id"],
+                        "pair": rule["pair"],
+                        "trait_stack": rule["trait_stack"],
+                        "winner_member": rule["winner_member"],
+                        "matched_conditions": matched,
+                        "total_conditions": total,
+                        "failed_cols": " | ".join(failed_cols[:10]),
+                        "winner_rate": rule["winner_rate"],
+                        "pair_gap": rule["pair_gap"],
+                        "support": rule["support"],
+                    }
+                )
 
     near_misses = sorted(
         near_misses,
@@ -452,14 +519,6 @@ def compress_member_scores(
     exclusivity_cap: float,
     min_compression_factor: float,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """
-    Cross-member compression.
-
-    Idea:
-    - Pull scores toward the mean by default.
-    - Allow true separation only when exclusivity evidence exists.
-    - Exclusivity comes from rule-count advantage and boost advantage.
-    """
     pre_scores = {m: float(base_scores.get(m, 0.0)) + float(boosts.get(m, 0.0)) for m in CORE025}
     mean_score = sum(pre_scores.values()) / len(CORE025)
 
@@ -540,9 +599,9 @@ def decide_play_mode(
     return "PLAY_TOP1", "Default Top1"
 
 
-def rank_members(
+def rank_members_from_maps(
     row: pd.Series,
-    transitions: pd.DataFrame,
+    maps: BaselineMaps,
     separator_rules: List[Dict[str, object]],
     min_stream_history: int,
     dominant_gap: float,
@@ -563,7 +622,7 @@ def rank_members(
     min_rule_margin_for_dominance: int,
     min_boost_margin_for_dominance: float,
 ) -> Dict[str, object]:
-    base = baseline_scores(row, transitions, min_stream_history=int(min_stream_history))
+    base = baseline_scores_from_maps(row, maps, min_stream_history=int(min_stream_history))
     boosts, fired_counts, fired_rules, near_misses, fail_counter, raw_boosts = apply_separator_rules(
         row=row,
         rules=separator_rules,
@@ -698,7 +757,11 @@ def rank_members(
     }
 
 
-def summarize(df: pd.DataFrame) -> pd.DataFrame:
+# -----------------------------------------------------------------------------
+# Summaries
+# -----------------------------------------------------------------------------
+
+def summarize_playlist(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     if len(df) == 0:
         return pd.DataFrame(columns=["metric", "value"])
@@ -719,14 +782,233 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main():
-    st.set_page_config(page_title="Core025 Separator Ranking Engine v2 Dominance RuleNorm Calibrated", layout="wide")
-    st.title("Core025 Separator Ranking Engine v2 Dominance RuleNorm Calibrated")
-    st.caption("Dominance-aware separator engine with capped scoring, diminishing returns, rule-count normalization, and cross-member compression.")
-    st.code(BUILD_MARKER, language="text")
+def summarize_lab(per_event: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if len(per_event) == 0:
+        empty = pd.DataFrame()
+        return empty, empty, empty, pd.DataFrame(columns=["metric", "value"])
 
+    per_date = (
+        per_event.groupby("transition_date", dropna=False)
+        .agg(
+            events=("event_id", "count"),
+            top1_hits=("top1_hit", "sum"),
+            top2_hits=("top2_hit", "sum"),
+            top3_hits=("top3_hit", "sum"),
+            play_rule_hits=("play_rule_hit", "sum"),
+            play_top1_rows=("is_play_top1", "sum"),
+            play_top2_rows=("is_play_top2", "sum"),
+            skip_rows=("is_skip", "sum"),
+        )
+        .reset_index()
+        .sort_values("transition_date")
+        .reset_index(drop=True)
+    )
+    per_date["top1_capture_pct"] = per_date["top1_hits"] / per_date["events"]
+    per_date["top2_capture_pct"] = per_date["top2_hits"] / per_date["events"]
+    per_date["top3_capture_pct"] = per_date["top3_hits"] / per_date["events"]
+    per_date["play_rule_capture_pct"] = per_date["play_rule_hits"] / per_date["events"]
+
+    per_stream = (
+        per_event.groupby("stream", dropna=False)
+        .agg(
+            events=("event_id", "count"),
+            top1_hits=("top1_hit", "sum"),
+            top2_hits=("top2_hit", "sum"),
+            top3_hits=("top3_hit", "sum"),
+            play_rule_hits=("play_rule_hit", "sum"),
+            play_top1_rows=("is_play_top1", "sum"),
+            play_top2_rows=("is_play_top2", "sum"),
+            skip_rows=("is_skip", "sum"),
+        )
+        .reset_index()
+        .sort_values(["play_rule_hits", "events", "stream"], ascending=[False, False, True])
+        .reset_index(drop=True)
+    )
+    per_stream["top1_capture_pct"] = per_stream["top1_hits"] / per_stream["events"]
+    per_stream["top2_capture_pct"] = per_stream["top2_hits"] / per_stream["events"]
+    per_stream["top3_capture_pct"] = per_stream["top3_hits"] / per_stream["events"]
+    per_stream["play_rule_capture_pct"] = per_stream["play_rule_hits"] / per_stream["events"]
+
+    by_mode = (
+        per_event.groupby("play_mode", dropna=False)
+        .agg(
+            events=("event_id", "count"),
+            avg_top1_score=("Top1_score", "mean"),
+            avg_gap=("gap", "mean"),
+            avg_ratio=("ratio", "mean"),
+            top1_capture=("top1_hit", "mean"),
+            top2_capture=("top2_hit", "mean"),
+            top3_capture=("top3_hit", "mean"),
+            play_rule_capture=("play_rule_hit", "mean"),
+        )
+        .reset_index()
+        .rename(columns={"play_mode": "bucket"})
+        .sort_values("bucket")
+        .reset_index(drop=True)
+    )
+
+    summary_rows = []
+    total = len(per_event)
+    summary_rows.append({"metric": "events", "value": total})
+    summary_rows.append({"metric": "top1_capture", "value": int(per_event["top1_hit"].sum())})
+    summary_rows.append({"metric": "top2_capture", "value": int(per_event["top2_hit"].sum())})
+    summary_rows.append({"metric": "top3_capture", "value": int(per_event["top3_hit"].sum())})
+    summary_rows.append({"metric": "play_rule_capture", "value": int(per_event["play_rule_hit"].sum())})
+    summary_rows.append({"metric": "top1_capture_pct", "value": float(per_event["top1_hit"].mean())})
+    summary_rows.append({"metric": "top2_capture_pct", "value": float(per_event["top2_hit"].mean())})
+    summary_rows.append({"metric": "top3_capture_pct", "value": float(per_event["top3_hit"].mean())})
+    summary_rows.append({"metric": "play_rule_capture_pct", "value": float(per_event["play_rule_hit"].mean())})
+    summary_rows.append({"metric": "play_top1_rows", "value": int(per_event["is_play_top1"].sum())})
+    summary_rows.append({"metric": "play_top2_rows", "value": int(per_event["is_play_top2"].sum())})
+    summary_rows.append({"metric": "skip_rows", "value": int(per_event["is_skip"].sum())})
+    summary_rows.append({"metric": "avg_gap", "value": float(per_event["gap"].mean())})
+    summary_rows.append({"metric": "avg_ratio", "value": float(per_event["ratio"].mean())})
+    summary_rows.append({"metric": "avg_compression_factor", "value": float(per_event["compression_factor"].mean())})
+    summary_rows.append({"metric": "avg_exclusivity_strength", "value": float(per_event["exclusivity_strength"].mean())})
+    summary_rows.append({"metric": "rows_dominant", "value": int((per_event["dominance_state"] == "DOMINANT").sum())})
+    summary_rows.append({"metric": "rows_contested", "value": int((per_event["dominance_state"] == "CONTESTED").sum())})
+    summary_rows.append({"metric": "rows_weak", "value": int((per_event["dominance_state"] == "WEAK").sum())})
+    summary_rows.append({"metric": "skip_score_cutoff_reference", "value": float(DEFAULT_SKIP_SCORE_CUTOFF)})
+    summary = pd.DataFrame(summary_rows)
+    return per_date, per_stream, by_mode, summary
+
+
+# -----------------------------------------------------------------------------
+# Regular run and LAB walk-forward runners
+# -----------------------------------------------------------------------------
+
+def run_regular_playlist(
+    hist: pd.DataFrame,
+    surv: pd.DataFrame,
+    separator_rules: List[Dict[str, object]],
+    params: Dict[str, float],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    transitions = build_transitions(hist)
+    maps = build_maps_from_transitions(transitions)
+
+    rows = []
+    for _, row in surv.iterrows():
+        ranked = rank_members_from_maps(
+            row=row,
+            maps=maps,
+            separator_rules=separator_rules,
+            min_stream_history=int(params["min_stream_history"]),
+            dominant_gap=float(params["dominant_gap"]),
+            contested_gap=float(params["contested_gap"]),
+            dominant_ratio_max=float(params["dominant_ratio_max"]),
+            contested_ratio_min=float(params["contested_ratio_min"]),
+            weak_top1_score_floor=float(params["weak_top1_score_floor"]),
+            per_rule_cap=float(params["per_rule_cap"]),
+            total_boost_cap=float(params["total_boost_cap"]),
+            diminishing_return_factor=float(params["diminishing_return_factor"]),
+            rule_count_norm_factor=float(params["rule_count_norm_factor"]),
+            max_rules_per_member=int(params["max_rules_per_member"]),
+            compression_alpha=float(params["compression_alpha"]),
+            exclusivity_rule_bonus=float(params["exclusivity_rule_bonus"]),
+            exclusivity_boost_bonus=float(params["exclusivity_boost_bonus"]),
+            exclusivity_cap=float(params["exclusivity_cap"]),
+            min_compression_factor=float(params["min_compression_factor"]),
+            min_rule_margin_for_dominance=int(params["min_rule_margin_for_dominance"]),
+            min_boost_margin_for_dominance=float(params["min_boost_margin_for_dominance"]),
+        )
+        rows.append({"stream": row["stream"], "seed": row["seed"], **ranked})
+
+    out = pd.DataFrame(rows).sort_values(
+        ["Top1_score", "gap", "fired_rule_count", "ratio"],
+        ascending=[False, False, False, True],
+    ).reset_index(drop=True)
+    summary = summarize_playlist(out)
+    return out, summary
+
+
+def run_lab_walkforward(
+    hist: pd.DataFrame,
+    separator_rules: List[Dict[str, object]],
+    params: Dict[str, float],
+    progress_bar=None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    transitions = build_transitions(hist)
+    if len(transitions) == 0:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty, pd.DataFrame(columns=["metric", "value"])
+
+    maps = init_baseline_maps()
+    rows = []
+    total = len(transitions)
+
+    for idx, (_, row) in enumerate(transitions.iterrows(), start=1):
+        ranked = rank_members_from_maps(
+            row=row,
+            maps=maps,
+            separator_rules=separator_rules,
+            min_stream_history=int(params["min_stream_history"]),
+            dominant_gap=float(params["dominant_gap"]),
+            contested_gap=float(params["contested_gap"]),
+            dominant_ratio_max=float(params["dominant_ratio_max"]),
+            contested_ratio_min=float(params["contested_ratio_min"]),
+            weak_top1_score_floor=float(params["weak_top1_score_floor"]),
+            per_rule_cap=float(params["per_rule_cap"]),
+            total_boost_cap=float(params["total_boost_cap"]),
+            diminishing_return_factor=float(params["diminishing_return_factor"]),
+            rule_count_norm_factor=float(params["rule_count_norm_factor"]),
+            max_rules_per_member=int(params["max_rules_per_member"]),
+            compression_alpha=float(params["compression_alpha"]),
+            exclusivity_rule_bonus=float(params["exclusivity_rule_bonus"]),
+            exclusivity_boost_bonus=float(params["exclusivity_boost_bonus"]),
+            exclusivity_cap=float(params["exclusivity_cap"]),
+            min_compression_factor=float(params["min_compression_factor"]),
+            min_rule_margin_for_dominance=int(params["min_rule_margin_for_dominance"]),
+            min_boost_margin_for_dominance=float(params["min_boost_margin_for_dominance"]),
+        )
+
+        winner_member = normalize_member_code(row["next_member"])
+        top1_hit = int(ranked["Top1"] == winner_member)
+        top2_hit = int((ranked["Top1"] == winner_member) or (ranked["Top2"] == winner_member))
+        top3_hit = int((ranked["Top1"] == winner_member) or (ranked["Top2"] == winner_member) or (ranked["Top3"] == winner_member))
+        play_rule_hit = 0
+        if ranked["play_mode"] == "PLAY_TOP1":
+            play_rule_hit = int(ranked["Top1"] == winner_member)
+        elif ranked["play_mode"] == "PLAY_TOP2":
+            play_rule_hit = int((ranked["Top1"] == winner_member) or (ranked["Top2"] == winner_member))
+        else:
+            play_rule_hit = 0
+
+        rows.append(
+            {
+                "event_id": int(row["event_id"]),
+                "transition_date": row["transition_date"],
+                "seed_date": row["seed_date"],
+                "stream": row["stream"],
+                "seed": row["seed"],
+                "winning_member": winner_member,
+                "top1_hit": top1_hit,
+                "top2_hit": top2_hit,
+                "top3_hit": top3_hit,
+                "play_rule_hit": play_rule_hit,
+                "is_play_top1": int(ranked["play_mode"] == "PLAY_TOP1"),
+                "is_play_top2": int(ranked["play_mode"] == "PLAY_TOP2"),
+                "is_skip": int(ranked["play_mode"] == "SKIP"),
+                **ranked,
+            }
+        )
+
+        add_transition_to_maps(maps, row)
+        if progress_bar is not None:
+            progress_bar.progress(idx / total)
+
+    per_event = pd.DataFrame(rows).sort_values(["event_id"]).reset_index(drop=True)
+    per_date, per_stream, by_mode, summary = summarize_lab(per_event)
+    return per_event, per_date, per_stream, by_mode, summary
+
+
+# -----------------------------------------------------------------------------
+# Streamlit UI
+# -----------------------------------------------------------------------------
+
+def collect_params_from_sidebar() -> Dict[str, float]:
     with st.sidebar:
         st.markdown(f"**{BUILD_MARKER}**")
+        run_mode = st.radio("Mode", ["Regular Run", "LAB Walk-Forward"], index=0)
         min_stream_history = st.number_input("Minimum stream history for baseline fallback", min_value=0, value=20, step=5)
 
         st.header("Scaling controls")
@@ -753,64 +1035,35 @@ def main():
         min_boost_margin_for_dominance = st.slider("Min Top1 boost margin for dominance", min_value=0.00, max_value=2.00, value=0.08, step=0.01)
 
         rows_to_show = st.number_input("Rows to display", min_value=5, value=50, step=5)
+        lab_max_events = st.number_input("LAB max events (0 = all)", min_value=0, value=0, step=50)
 
-    hist_file = st.file_uploader("Upload FULL history file", key="sep_rank_hist_dom_rn_cal")
-    surv_file = st.file_uploader("Upload PLAY survivors file", key="sep_rank_surv_dom_rn_cal")
-    sep_library_file = st.file_uploader("Upload promoted separator library CSV", key="sep_rank_lib_dom_rn_cal")
+    return {
+        "run_mode": run_mode,
+        "min_stream_history": float(min_stream_history),
+        "per_rule_cap": float(per_rule_cap),
+        "total_boost_cap": float(total_boost_cap),
+        "diminishing_return_factor": float(diminishing_return_factor),
+        "rule_count_norm_factor": float(rule_count_norm_factor),
+        "max_rules_per_member": float(max_rules_per_member),
+        "compression_alpha": float(compression_alpha),
+        "exclusivity_rule_bonus": float(exclusivity_rule_bonus),
+        "exclusivity_boost_bonus": float(exclusivity_boost_bonus),
+        "exclusivity_cap": float(exclusivity_cap),
+        "min_compression_factor": float(min_compression_factor),
+        "dominant_gap": float(dominant_gap),
+        "contested_gap": float(contested_gap),
+        "dominant_ratio_max": float(dominant_ratio_max),
+        "contested_ratio_min": float(contested_ratio_min),
+        "weak_top1_score_floor": float(weak_top1_score_floor),
+        "min_rule_margin_for_dominance": float(min_rule_margin_for_dominance),
+        "min_boost_margin_for_dominance": float(min_boost_margin_for_dominance),
+        "rows_to_show": int(rows_to_show),
+        "lab_max_events": int(lab_max_events),
+    }
 
-    if not all([hist_file, surv_file, sep_library_file]):
-        st.info("Upload the full history file, play survivors file, and promoted separator library CSV.")
-        return
 
-    try:
-        hist = prep_history(load_table(hist_file))
-        surv = prep_survivors(load_table(surv_file))
-        sep_lib_df = load_table(sep_library_file)
-        separator_rules = load_separator_library(sep_lib_df)
-    except Exception as e:
-        st.exception(e)
-        return
-
-    transitions = build_transitions(hist)
-    rows = []
-    progress = st.progress(0.0)
-    total = len(surv)
-
-    for i, (_, row) in enumerate(surv.iterrows(), start=1):
-        ranked = rank_members(
-            row=row,
-            transitions=transitions,
-            separator_rules=separator_rules,
-            min_stream_history=int(min_stream_history),
-            dominant_gap=float(dominant_gap),
-            contested_gap=float(contested_gap),
-            dominant_ratio_max=float(dominant_ratio_max),
-            contested_ratio_min=float(contested_ratio_min),
-            weak_top1_score_floor=float(weak_top1_score_floor),
-            per_rule_cap=float(per_rule_cap),
-            total_boost_cap=float(total_boost_cap),
-            diminishing_return_factor=float(diminishing_return_factor),
-            rule_count_norm_factor=float(rule_count_norm_factor),
-            max_rules_per_member=int(max_rules_per_member),
-            compression_alpha=float(compression_alpha),
-            exclusivity_rule_bonus=float(exclusivity_rule_bonus),
-            exclusivity_boost_bonus=float(exclusivity_boost_bonus),
-            exclusivity_cap=float(exclusivity_cap),
-            min_compression_factor=float(min_compression_factor),
-            min_rule_margin_for_dominance=int(min_rule_margin_for_dominance),
-            min_boost_margin_for_dominance=float(min_boost_margin_for_dominance),
-        )
-        rows.append({"stream": row["stream"], "seed": row["seed"], **ranked})
-        progress.progress(i / total if total else 1.0)
-
-    progress.empty()
-    out = pd.DataFrame(rows).sort_values(
-        ["Top1_score", "gap", "fired_rule_count", "ratio"],
-        ascending=[False, False, False, True],
-    ).reset_index(drop=True)
-    summary = summarize(out)
-
-    st.subheader("Dominance summary")
+def render_regular_results(out: pd.DataFrame, summary: pd.DataFrame, rows_to_show: int) -> None:
+    st.subheader("Regular Run summary")
     st.dataframe(summary, use_container_width=True)
 
     st.subheader("Playlist preview")
@@ -851,17 +1104,146 @@ def main():
     st.dataframe(out[present_cols].head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_separator_ranked_playlist_v2_dominance_rulenorm_calibrated__2026-03-31.csv",
+        "Download core025_separator_ranked_playlist__2026-03-31.csv",
         data=out.to_csv(index=False),
-        file_name="core025_separator_ranked_playlist_v2_dominance_rulenorm_calibrated__2026-03-31.csv",
+        file_name="core025_separator_ranked_playlist__2026-03-31.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_separator_dominance_summary_v2_rulenorm_calibrated__2026-03-31.csv",
+        "Download core025_separator_summary__2026-03-31.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_separator_dominance_summary_v2_rulenorm_calibrated__2026-03-31.csv",
+        file_name="core025_separator_summary__2026-03-31.csv",
         mime="text/csv",
     )
+
+
+def render_lab_results(per_event: pd.DataFrame, per_date: pd.DataFrame, per_stream: pd.DataFrame, by_mode: pd.DataFrame, summary: pd.DataFrame, rows_to_show: int) -> None:
+    st.subheader("LAB summary")
+    st.dataframe(summary, use_container_width=True)
+
+    st.subheader("Recommendation breakdown by bucket")
+    st.dataframe(by_mode, use_container_width=True)
+
+    st.subheader("Per-event preview")
+    st.dataframe(per_event.head(int(rows_to_show)), use_container_width=True)
+
+    st.subheader("Per-date summary")
+    st.dataframe(per_date.head(int(rows_to_show)), use_container_width=True)
+
+    st.subheader("Per-stream summary")
+    st.dataframe(per_stream.head(int(rows_to_show)), use_container_width=True)
+
+    st.download_button(
+        "Download core025_lab_per_event__2026-03-31.csv",
+        data=per_event.to_csv(index=False),
+        file_name="core025_lab_per_event__2026-03-31.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download core025_lab_per_date__2026-03-31.csv",
+        data=per_date.to_csv(index=False),
+        file_name="core025_lab_per_date__2026-03-31.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download core025_lab_per_stream__2026-03-31.csv",
+        data=per_stream.to_csv(index=False),
+        file_name="core025_lab_per_stream__2026-03-31.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download core025_lab_summary__2026-03-31.csv",
+        data=summary.to_csv(index=False),
+        file_name="core025_lab_summary__2026-03-31.csv",
+        mime="text/csv",
+    )
+
+
+def main():
+    st.set_page_config(page_title="Core025 Separator Engine + LAB Walk-Forward", layout="wide")
+    st.title("Core025 Separator Engine + LAB Walk-Forward")
+    st.caption("Regular current-slate separator run plus optional full no-lookahead LAB walk-forward in one file.")
+    st.code(BUILD_MARKER, language="text")
+
+    params = collect_params_from_sidebar()
+    run_mode = params["run_mode"]
+    rows_to_show = params["rows_to_show"]
+    lab_max_events = params["lab_max_events"]
+
+    hist_file = st.file_uploader("Upload FULL history file", key="core025_full_history")
+    sep_library_file = st.file_uploader("Upload promoted separator library CSV", key="core025_separator_library")
+
+    if run_mode == "Regular Run":
+        surv_file = st.file_uploader("Upload PLAY survivors file", key="core025_survivors")
+    else:
+        surv_file = None
+
+    if run_mode == "Regular Run" and not all([hist_file, sep_library_file, surv_file]):
+        st.info("Upload the full history file, promoted separator library CSV, and play survivors file.")
+        return
+    if run_mode == "LAB Walk-Forward" and not all([hist_file, sep_library_file]):
+        st.info("Upload the full history file and promoted separator library CSV.")
+        return
+
+    try:
+        hist = prep_history(load_table(hist_file))
+        sep_lib_df = load_table(sep_library_file)
+        separator_rules = load_separator_library(sep_lib_df)
+        if surv_file is not None:
+            surv = prep_survivors(load_table(surv_file))
+        else:
+            surv = None
+    except Exception as e:
+        st.exception(e)
+        return
+
+    if run_mode == "Regular Run":
+        if st.button("Run Regular Playlist", type="primary"):
+            with st.spinner("Running regular playlist..."):
+                out, summary = run_regular_playlist(hist, surv, separator_rules, params)
+                st.session_state["core025_regular_out"] = out
+                st.session_state["core025_regular_summary"] = summary
+
+        if "core025_regular_out" in st.session_state and "core025_regular_summary" in st.session_state:
+            render_regular_results(
+                st.session_state["core025_regular_out"],
+                st.session_state["core025_regular_summary"],
+                rows_to_show,
+            )
+
+    else:
+        if st.button("Run LAB Walk-Forward", type="primary"):
+            with st.spinner("Running full no-lookahead LAB walk-forward..."):
+                progress = st.progress(0.0)
+                per_event, per_date, per_stream, by_mode, summary = run_lab_walkforward(hist, separator_rules, params, progress_bar=progress)
+                progress.empty()
+                if lab_max_events > 0:
+                    per_event = per_event.head(lab_max_events).copy()
+                    per_date, per_stream, by_mode, summary = summarize_lab(per_event)
+                st.session_state["core025_lab_per_event"] = per_event
+                st.session_state["core025_lab_per_date"] = per_date
+                st.session_state["core025_lab_per_stream"] = per_stream
+                st.session_state["core025_lab_by_mode"] = by_mode
+                st.session_state["core025_lab_summary"] = summary
+
+        if all(
+            key in st.session_state
+            for key in [
+                "core025_lab_per_event",
+                "core025_lab_per_date",
+                "core025_lab_per_stream",
+                "core025_lab_by_mode",
+                "core025_lab_summary",
+            ]
+        ):
+            render_lab_results(
+                st.session_state["core025_lab_per_event"],
+                st.session_state["core025_lab_per_date"],
+                st.session_state["core025_lab_per_stream"],
+                st.session_state["core025_lab_by_mode"],
+                st.session_state["core025_lab_summary"],
+                rows_to_show,
+            )
 
 
 if __name__ == "__main__":
