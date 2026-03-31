@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# core025_separator_ranking_engine_v2_dominance_rulenorm__2026-03-30.py
+# core025_separator_ranking_engine_v2_dominance_rulenorm_calibrated__2026-03-31.py
 #
-# BUILD: core025_separator_ranking_engine_v2_dominance_rulenorm__2026-03-30
+# BUILD: core025_separator_ranking_engine_v2_dominance_rulenorm_calibrated__2026-03-31
 #
 # Full file. No placeholders.
 #
@@ -10,17 +10,20 @@
 # Dominance-aware separator ranking engine for Core025 with:
 # - scaling fix
 # - rule-count normalization
-# - hard normalized member outputs
+# - diminishing returns
+# - cross-member compression
+# - dominance calibration based on score separation + rule quality
 # - play-mode decisions
 #
 # Outputs
 # -------
-# - core025_separator_ranked_playlist_v2_dominance_rulenorm__2026-03-30.csv
-# - core025_separator_dominance_summary_v2_rulenorm__2026-03-30.csv
+# - core025_separator_ranked_playlist_v2_dominance_rulenorm_calibrated__2026-03-31.csv
+# - core025_separator_dominance_summary_v2_rulenorm_calibrated__2026-03-31.csv
 
 from __future__ import annotations
 
 import io
+import math
 import re
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -29,7 +32,7 @@ import pandas as pd
 import streamlit as st
 
 CORE025 = ["0025", "0225", "0255"]
-BUILD_MARKER = "BUILD: core025_separator_ranking_engine_v2_dominance_rulenorm__2026-03-30"
+BUILD_MARKER = "BUILD: core025_separator_ranking_engine_v2_dominance_rulenorm_calibrated__2026-03-31"
 
 
 def load_table(f) -> pd.DataFrame:
@@ -184,19 +187,23 @@ def prep_history(df: pd.DataFrame) -> pd.DataFrame:
         if "date" not in df.columns:
             for c in df.columns:
                 if "date" in c:
-                    rename_map[c] = "date"; break
+                    rename_map[c] = "date"
+                    break
         if "jurisdiction" not in df.columns:
             for c in df.columns:
                 if "jurisdiction" in c or "state" in c:
-                    rename_map[c] = "jurisdiction"; break
+                    rename_map[c] = "jurisdiction"
+                    break
         if "game" not in df.columns:
             for c in df.columns:
                 if "game" in c or "stream" in c:
-                    rename_map[c] = "game"; break
+                    rename_map[c] = "game"
+                    break
         if "result" not in df.columns:
             for c in df.columns:
                 if "result" in c:
-                    rename_map[c] = "result"; break
+                    rename_map[c] = "result"
+                    break
         df = df.rename(columns=rename_map)
         needed = {"date", "jurisdiction", "game", "result"}
         missing = needed - set(df.columns)
@@ -251,6 +258,8 @@ def build_transitions(df: pd.DataFrame) -> pd.DataFrame:
                 "next_member": next_member,
                 **feat,
             })
+    if not rows:
+        return pd.DataFrame(columns=["stream", "seed", "seed_date", "transition_date", "next_member"])
     return pd.DataFrame(rows).sort_values(["transition_date", "stream", "seed"]).reset_index(drop=True)
 
 
@@ -366,9 +375,10 @@ def apply_separator_rules(
     diminishing_return_factor: float,
     rule_count_norm_factor: float,
     max_rules_per_member: int,
-) -> Tuple[Dict[str, float], Dict[str, int], List[str], List[Dict[str, object]], Counter]:
+) -> Tuple[Dict[str, float], Dict[str, int], List[str], List[Dict[str, object]], Counter, Dict[str, float]]:
     boosts = {m: 0.0 for m in CORE025}
     fired_counts = {m: 0 for m in CORE025}
+    raw_boosts = {m: 0.0 for m in CORE025}
     fired_rules: List[str] = []
     near_misses: List[Dict[str, object]] = []
     fail_counter: Counter = Counter()
@@ -388,16 +398,18 @@ def apply_separator_rules(
             raw_score += 0.03 * max(rule["stack_size"] - 1, 0)
             raw_score = min(raw_score, float(per_rule_cap))
 
-            # diminishing returns + rule-count normalization
-            scaled_score = raw_score * (1.0 / (1.0 + fired_counts[winner] * float(diminishing_return_factor)))
-            scaled_score = scaled_score / (1.0 + fired_counts[winner] * float(rule_count_norm_factor))
+            # First-stage normalization: within-member diminishing returns.
+            diminishing_scale = 1.0 / (1.0 + fired_counts[winner] * float(diminishing_return_factor))
+            count_norm_scale = 1.0 / (1.0 + fired_counts[winner] * float(rule_count_norm_factor))
+            scaled_score = raw_score * diminishing_scale * count_norm_scale
 
+            raw_boosts[winner] += raw_score
             boosts[winner] += scaled_score
             boosts[winner] = min(boosts[winner], float(total_boost_cap))
             fired_counts[winner] += 1
 
             fired_rules.append(
-                f"RID{rule['rule_id']} | {rule['pair']} | {rule['trait_stack']} | winner={winner} | score={scaled_score:.3f} | wr={rule['winner_rate']:.3f} | gap={rule['pair_gap']:.3f} | sup={rule['support']}"
+                f"RID{rule['rule_id']} | {rule['pair']} | {rule['trait_stack']} | winner={winner} | raw={raw_score:.3f} | scaled={scaled_score:.3f} | wr={rule['winner_rate']:.3f} | gap={rule['pair_gap']:.3f} | sup={rule['support']}"
             )
         else:
             for fc in failed_cols:
@@ -427,20 +439,104 @@ def apply_separator_rules(
         reverse=True,
     )[:20]
 
-    return boosts, fired_counts, fired_rules, near_misses, fail_counter
+    return boosts, fired_counts, fired_rules, near_misses, fail_counter, raw_boosts
 
 
-def decide_play_mode(top1_score: float, top2_score: float, gap: float, ratio: float,
-                     top1_rule_count: int, top2_rule_count: int,
-                     dominant_gap: float, contested_gap: float,
-                     dominant_ratio_max: float, contested_ratio_min: float,
-                     weak_top1_score_floor: float) -> Tuple[str, str]:
+def compress_member_scores(
+    base_scores: Dict[str, float],
+    boosts: Dict[str, float],
+    fired_counts: Dict[str, int],
+    compression_alpha: float,
+    exclusivity_rule_bonus: float,
+    exclusivity_boost_bonus: float,
+    exclusivity_cap: float,
+    min_compression_factor: float,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Cross-member compression.
+
+    Idea:
+    - Pull scores toward the mean by default.
+    - Allow true separation only when exclusivity evidence exists.
+    - Exclusivity comes from rule-count advantage and boost advantage.
+    """
+    pre_scores = {m: float(base_scores.get(m, 0.0)) + float(boosts.get(m, 0.0)) for m in CORE025}
+    mean_score = sum(pre_scores.values()) / len(CORE025)
+
+    ranked_rule_counts = sorted(fired_counts.values(), reverse=True)
+    top_rule_count = ranked_rule_counts[0] if ranked_rule_counts else 0
+    second_rule_count = ranked_rule_counts[1] if len(ranked_rule_counts) > 1 else 0
+    rule_gap = max(0, top_rule_count - second_rule_count)
+
+    ranked_boosts = sorted(boosts.values(), reverse=True)
+    top_boost = ranked_boosts[0] if ranked_boosts else 0.0
+    second_boost = ranked_boosts[1] if len(ranked_boosts) > 1 else 0.0
+    boost_gap = max(0.0, top_boost - second_boost)
+
+    exclusivity_strength = min(
+        float(exclusivity_cap),
+        (rule_gap * float(exclusivity_rule_bonus)) + (boost_gap * float(exclusivity_boost_bonus)),
+    )
+
+    compression_factor = max(
+        float(min_compression_factor),
+        min(1.0, float(compression_alpha) + exclusivity_strength),
+    )
+
+    compressed = {}
+    for m in CORE025:
+        delta = pre_scores[m] - mean_score
+        compressed[m] = mean_score + (delta * compression_factor)
+
+    diagnostics = {
+        "pre_mean_score": mean_score,
+        "compression_factor": compression_factor,
+        "exclusivity_strength": exclusivity_strength,
+        "rule_gap_top12": float(rule_gap),
+        "boost_gap_top12": float(boost_gap),
+    }
+    return compressed, diagnostics
+
+
+def decide_play_mode(
+    top1_score: float,
+    top2_score: float,
+    gap: float,
+    ratio: float,
+    top1_rule_count: int,
+    top2_rule_count: int,
+    top1_boost: float,
+    top2_boost: float,
+    dominant_gap: float,
+    contested_gap: float,
+    dominant_ratio_max: float,
+    contested_ratio_min: float,
+    weak_top1_score_floor: float,
+    min_rule_margin_for_dominance: int,
+    min_boost_margin_for_dominance: float,
+) -> Tuple[str, str]:
     if top1_score < float(weak_top1_score_floor):
         return "SKIP", "Top1 score too weak"
-    if gap >= float(dominant_gap) and ratio <= float(dominant_ratio_max) and top1_rule_count > top2_rule_count:
+
+    rule_margin = int(top1_rule_count) - int(top2_rule_count)
+    boost_margin = float(top1_boost) - float(top2_boost)
+
+    if (
+        gap >= float(dominant_gap)
+        and ratio <= float(dominant_ratio_max)
+        and rule_margin >= int(min_rule_margin_for_dominance)
+        and boost_margin >= float(min_boost_margin_for_dominance)
+    ):
         return "PLAY_TOP1", "Dominant Top1"
-    if gap < float(contested_gap) or ratio >= float(contested_ratio_min) or top2_rule_count >= top1_rule_count:
+
+    if (
+        gap < float(contested_gap)
+        or ratio >= float(contested_ratio_min)
+        or top2_rule_count >= top1_rule_count
+        or boost_margin < float(min_boost_margin_for_dominance)
+    ):
         return "PLAY_TOP2", "Contested row"
+
     return "PLAY_TOP1", "Default Top1"
 
 
@@ -459,9 +555,16 @@ def rank_members(
     diminishing_return_factor: float,
     rule_count_norm_factor: float,
     max_rules_per_member: int,
+    compression_alpha: float,
+    exclusivity_rule_bonus: float,
+    exclusivity_boost_bonus: float,
+    exclusivity_cap: float,
+    min_compression_factor: float,
+    min_rule_margin_for_dominance: int,
+    min_boost_margin_for_dominance: float,
 ) -> Dict[str, object]:
     base = baseline_scores(row, transitions, min_stream_history=int(min_stream_history))
-    boosts, fired_counts, fired_rules, near_misses, fail_counter = apply_separator_rules(
+    boosts, fired_counts, fired_rules, near_misses, fail_counter, raw_boosts = apply_separator_rules(
         row=row,
         rules=separator_rules,
         per_rule_cap=float(per_rule_cap),
@@ -471,9 +574,19 @@ def rank_members(
         max_rules_per_member=int(max_rules_per_member),
     )
 
-    final_scores = {m: base[m] + boosts[m] for m in CORE025}
+    compressed_scores, compression_diag = compress_member_scores(
+        base_scores=base,
+        boosts=boosts,
+        fired_counts=fired_counts,
+        compression_alpha=float(compression_alpha),
+        exclusivity_rule_bonus=float(exclusivity_rule_bonus),
+        exclusivity_boost_bonus=float(exclusivity_boost_bonus),
+        exclusivity_cap=float(exclusivity_cap),
+        min_compression_factor=float(min_compression_factor),
+    )
+
     normalized_scores: Dict[str, float] = {}
-    for k, v in final_scores.items():
+    for k, v in compressed_scores.items():
         k_norm = normalize_member_code(k)
         if k_norm is None:
             continue
@@ -493,23 +606,51 @@ def rank_members(
     ratio = (top2_score / top1_score) if top1_score > 0 else 1.0
     top1_rule_count = fired_counts.get(top1, 0)
     top2_rule_count = fired_counts.get(top2, 0)
+    top1_boost = boosts.get(top1, 0.0)
+    top2_boost = boosts.get(top2, 0.0)
+    rule_margin = top1_rule_count - top2_rule_count
+    boost_margin = top1_boost - top2_boost
 
-    if gap >= float(dominant_gap) and ratio <= float(dominant_ratio_max) and top1_rule_count > top2_rule_count:
+    if (
+        gap >= float(dominant_gap)
+        and ratio <= float(dominant_ratio_max)
+        and rule_margin >= int(min_rule_margin_for_dominance)
+        and boost_margin >= float(min_boost_margin_for_dominance)
+    ):
         dominance_state = "DOMINANT"
-    elif gap < float(contested_gap) or ratio >= float(contested_ratio_min) or top2_rule_count >= top1_rule_count:
+    elif (
+        gap < float(contested_gap)
+        or ratio >= float(contested_ratio_min)
+        or top2_rule_count >= top1_rule_count
+        or boost_margin < float(min_boost_margin_for_dominance)
+    ):
         dominance_state = "CONTESTED"
     else:
         dominance_state = "WEAK"
 
     play_mode, play_reason = decide_play_mode(
-        top1_score, top2_score, gap, ratio, top1_rule_count, top2_rule_count,
-        float(dominant_gap), float(contested_gap),
-        float(dominant_ratio_max), float(contested_ratio_min),
-        float(weak_top1_score_floor)
+        top1_score=top1_score,
+        top2_score=top2_score,
+        gap=gap,
+        ratio=ratio,
+        top1_rule_count=top1_rule_count,
+        top2_rule_count=top2_rule_count,
+        top1_boost=top1_boost,
+        top2_boost=top2_boost,
+        dominant_gap=float(dominant_gap),
+        contested_gap=float(contested_gap),
+        dominant_ratio_max=float(dominant_ratio_max),
+        contested_ratio_min=float(contested_ratio_min),
+        weak_top1_score_floor=float(weak_top1_score_floor),
+        min_rule_margin_for_dominance=int(min_rule_margin_for_dominance),
+        min_boost_margin_for_dominance=float(min_boost_margin_for_dominance),
     )
 
     near_text = " || ".join(
-        [f"RID{x['rule_id']} {x['pair']} {x['matched_conditions']}/{x['total_conditions']} winner={x['winner_member']} failed={x['failed_cols']}" for x in near_misses[:10]]
+        [
+            f"RID{x['rule_id']} {x['pair']} {x['matched_conditions']}/{x['total_conditions']} winner={x['winner_member']} failed={x['failed_cols']}"
+            for x in near_misses[:10]
+        ]
     )
     fail_top = " || ".join([f"{k}:{v}" for k, v in fail_counter.most_common(10)])
 
@@ -517,12 +658,18 @@ def rank_members(
         "base_0025": base["0025"],
         "base_0225": base["0225"],
         "base_0255": base["0255"],
+        "raw_boost_0025": raw_boosts["0025"],
+        "raw_boost_0225": raw_boosts["0225"],
+        "raw_boost_0255": raw_boosts["0255"],
         "boost_0025": boosts["0025"],
         "boost_0225": boosts["0225"],
         "boost_0255": boosts["0255"],
         "rules_0025": fired_counts["0025"],
         "rules_0225": fired_counts["0225"],
         "rules_0255": fired_counts["0255"],
+        "precompress_0025": base["0025"] + boosts["0025"],
+        "precompress_0225": base["0225"] + boosts["0225"],
+        "precompress_0255": base["0255"] + boosts["0255"],
         "final_0025": normalized_scores.get("0025", 0.0),
         "final_0225": normalized_scores.get("0225", 0.0),
         "final_0255": normalized_scores.get("0255", 0.0),
@@ -537,6 +684,12 @@ def rank_members(
         "dominance_state": dominance_state,
         "play_mode": play_mode,
         "play_reason": play_reason,
+        "compression_factor": compression_diag["compression_factor"],
+        "exclusivity_strength": compression_diag["exclusivity_strength"],
+        "rule_gap_top12": compression_diag["rule_gap_top12"],
+        "boost_gap_top12": compression_diag["boost_gap_top12"],
+        "rule_margin_top1_top2": rule_margin,
+        "boost_margin_top1_top2": boost_margin,
         "fired_rule_count": len(fired_rules),
         "fired_rules": " || ".join(fired_rules[:25]),
         "near_miss_rule_count": len(near_misses),
@@ -559,13 +712,17 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     rows.append({"metric": "avg_gap", "value": float(df["gap"].mean())})
     rows.append({"metric": "avg_ratio", "value": float(df["ratio"].mean())})
     rows.append({"metric": "avg_fired_rule_count", "value": float(df["fired_rule_count"].mean())})
+    rows.append({"metric": "avg_compression_factor", "value": float(df["compression_factor"].mean())})
+    rows.append({"metric": "avg_exclusivity_strength", "value": float(df["exclusivity_strength"].mean())})
+    rows.append({"metric": "avg_rule_gap_top12", "value": float(df["rule_gap_top12"].mean())})
+    rows.append({"metric": "avg_boost_gap_top12", "value": float(df["boost_gap_top12"].mean())})
     return pd.DataFrame(rows)
 
 
 def main():
-    st.set_page_config(page_title="Core025 Separator Ranking Engine v2 Dominance RuleNorm", layout="wide")
-    st.title("Core025 Separator Ranking Engine v2 Dominance RuleNorm")
-    st.caption("Dominance-aware separator engine with capped scoring, diminishing returns, and rule-count normalization.")
+    st.set_page_config(page_title="Core025 Separator Ranking Engine v2 Dominance RuleNorm Calibrated", layout="wide")
+    st.title("Core025 Separator Ranking Engine v2 Dominance RuleNorm Calibrated")
+    st.caption("Dominance-aware separator engine with capped scoring, diminishing returns, rule-count normalization, and cross-member compression.")
     st.code(BUILD_MARKER, language="text")
 
     with st.sidebar:
@@ -575,22 +732,31 @@ def main():
         st.header("Scaling controls")
         per_rule_cap = st.slider("Per-rule cap", min_value=0.10, max_value=5.00, value=2.50, step=0.05)
         total_boost_cap = st.slider("Total boost cap per member", min_value=0.50, max_value=20.00, value=10.00, step=0.10)
-        diminishing_return_factor = st.slider("Diminishing return factor", min_value=0.00, max_value=1.00, value=0.15, step=0.01)
-        rule_count_norm_factor = st.slider("Rule-count normalization factor", min_value=0.00, max_value=1.00, value=0.25, step=0.01)
-        max_rules_per_member = st.number_input("Max fired rules per member", min_value=1, max_value=100, value=10, step=1)
+        diminishing_return_factor = st.slider("Diminishing return factor", min_value=0.00, max_value=3.00, value=0.35, step=0.01)
+        rule_count_norm_factor = st.slider("Rule-count normalization factor", min_value=0.00, max_value=3.00, value=1.50, step=0.01)
+        max_rules_per_member = st.number_input("Max fired rules per member", min_value=1, max_value=100, value=5, step=1)
+
+        st.header("Cross-member compression")
+        compression_alpha = st.slider("Base compression alpha", min_value=0.05, max_value=1.00, value=0.45, step=0.01)
+        exclusivity_rule_bonus = st.slider("Exclusivity bonus per rule-gap", min_value=0.00, max_value=0.50, value=0.08, step=0.01)
+        exclusivity_boost_bonus = st.slider("Exclusivity bonus per boost-gap", min_value=0.00, max_value=1.00, value=0.20, step=0.01)
+        exclusivity_cap = st.slider("Exclusivity cap", min_value=0.00, max_value=1.00, value=0.35, step=0.01)
+        min_compression_factor = st.slider("Minimum compression factor", min_value=0.05, max_value=1.00, value=0.30, step=0.01)
 
         st.header("Dominance thresholds")
-        dominant_gap = st.slider("Dominant gap threshold", min_value=0.00, max_value=1.00, value=0.08, step=0.01)
-        contested_gap = st.slider("Contested gap threshold", min_value=0.00, max_value=1.00, value=0.03, step=0.01)
-        dominant_ratio_max = st.slider("Dominant max ratio", min_value=0.50, max_value=1.00, value=0.92, step=0.01)
-        contested_ratio_min = st.slider("Contested min ratio", min_value=0.50, max_value=1.00, value=0.97, step=0.01)
+        dominant_gap = st.slider("Dominant gap threshold", min_value=0.00, max_value=2.00, value=0.18, step=0.01)
+        contested_gap = st.slider("Contested gap threshold", min_value=0.00, max_value=2.00, value=0.08, step=0.01)
+        dominant_ratio_max = st.slider("Dominant max ratio", min_value=0.50, max_value=1.00, value=0.88, step=0.01)
+        contested_ratio_min = st.slider("Contested min ratio", min_value=0.50, max_value=1.00, value=0.94, step=0.01)
         weak_top1_score_floor = st.slider("Weak Top1 score floor", min_value=0.00, max_value=5.00, value=0.20, step=0.01)
+        min_rule_margin_for_dominance = st.number_input("Min Top1 rule margin for dominance", min_value=0, max_value=20, value=1, step=1)
+        min_boost_margin_for_dominance = st.slider("Min Top1 boost margin for dominance", min_value=0.00, max_value=2.00, value=0.08, step=0.01)
 
         rows_to_show = st.number_input("Rows to display", min_value=5, value=50, step=5)
 
-    hist_file = st.file_uploader("Upload FULL history file", key="sep_rank_hist_dom_rn")
-    surv_file = st.file_uploader("Upload PLAY survivors file", key="sep_rank_surv_dom_rn")
-    sep_library_file = st.file_uploader("Upload promoted separator library CSV", key="sep_rank_lib_dom_rn")
+    hist_file = st.file_uploader("Upload FULL history file", key="sep_rank_hist_dom_rn_cal")
+    surv_file = st.file_uploader("Upload PLAY survivors file", key="sep_rank_surv_dom_rn_cal")
+    sep_library_file = st.file_uploader("Upload promoted separator library CSV", key="sep_rank_lib_dom_rn_cal")
 
     if not all([hist_file, surv_file, sep_library_file]):
         st.info("Upload the full history file, play survivors file, and promoted separator library CSV.")
@@ -626,6 +792,13 @@ def main():
             diminishing_return_factor=float(diminishing_return_factor),
             rule_count_norm_factor=float(rule_count_norm_factor),
             max_rules_per_member=int(max_rules_per_member),
+            compression_alpha=float(compression_alpha),
+            exclusivity_rule_bonus=float(exclusivity_rule_bonus),
+            exclusivity_boost_bonus=float(exclusivity_boost_bonus),
+            exclusivity_cap=float(exclusivity_cap),
+            min_compression_factor=float(min_compression_factor),
+            min_rule_margin_for_dominance=int(min_rule_margin_for_dominance),
+            min_boost_margin_for_dominance=float(min_boost_margin_for_dominance),
         )
         rows.append({"stream": row["stream"], "seed": row["seed"], **ranked})
         progress.progress(i / total if total else 1.0)
@@ -633,29 +806,60 @@ def main():
     progress.empty()
     out = pd.DataFrame(rows).sort_values(
         ["Top1_score", "gap", "fired_rule_count", "ratio"],
-        ascending=[False, False, False, True]
+        ascending=[False, False, False, True],
     ).reset_index(drop=True)
     summary = summarize(out)
 
     st.subheader("Dominance summary")
     st.dataframe(summary, use_container_width=True)
+
     st.subheader("Playlist preview")
     st.dataframe(out.head(int(rows_to_show)), use_container_width=True)
+
     st.subheader("Play mode distribution")
-    st.dataframe(out["play_mode"].value_counts(dropna=False).rename_axis("play_mode").reset_index(name="count"), use_container_width=True)
+    st.dataframe(
+        out["play_mode"].value_counts(dropna=False).rename_axis("play_mode").reset_index(name="count"),
+        use_container_width=True,
+    )
+
     st.subheader("Dominance state distribution")
-    st.dataframe(out["dominance_state"].value_counts(dropna=False).rename_axis("dominance_state").reset_index(name="count"), use_container_width=True)
+    st.dataframe(
+        out["dominance_state"].value_counts(dropna=False).rename_axis("dominance_state").reset_index(name="count"),
+        use_container_width=True,
+    )
+
+    st.subheader("Compression diagnostics")
+    compression_cols = [
+        "stream",
+        "seed",
+        "Top1",
+        "Top2",
+        "Top1_score",
+        "Top2_score",
+        "gap",
+        "ratio",
+        "compression_factor",
+        "exclusivity_strength",
+        "rule_gap_top12",
+        "boost_gap_top12",
+        "rule_margin_top1_top2",
+        "boost_margin_top1_top2",
+        "play_mode",
+        "dominance_state",
+    ]
+    present_cols = [c for c in compression_cols if c in out.columns]
+    st.dataframe(out[present_cols].head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_separator_ranked_playlist_v2_dominance_rulenorm__2026-03-30.csv",
+        "Download core025_separator_ranked_playlist_v2_dominance_rulenorm_calibrated__2026-03-31.csv",
         data=out.to_csv(index=False),
-        file_name="core025_separator_ranked_playlist_v2_dominance_rulenorm__2026-03-30.csv",
+        file_name="core025_separator_ranked_playlist_v2_dominance_rulenorm_calibrated__2026-03-31.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_separator_dominance_summary_v2_rulenorm__2026-03-30.csv",
+        "Download core025_separator_dominance_summary_v2_rulenorm_calibrated__2026-03-31.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_separator_dominance_summary_v2_rulenorm__2026-03-30.csv",
+        file_name="core025_separator_dominance_summary_v2_rulenorm_calibrated__2026-03-31.csv",
         mime="text/csv",
     )
 
