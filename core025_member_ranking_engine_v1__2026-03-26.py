@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# core025_separator_engine_plus_lab_walkforward__2026-04-03_v9.py
+# core025_separator_engine_plus_lab_walkforward__2026-04-03_v10.py
 #
-# BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-03_v9
+# BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-03_v10
 #
 # Full file. No placeholders.
 #
@@ -31,14 +31,14 @@
 # Outputs
 # -------
 # Regular Run:
-# - core025_separator_ranked_playlist__2026-04-03_v9.csv
-# - core025_separator_summary__2026-04-03_v9.csv
+# - core025_separator_ranked_playlist__2026-04-03_v10.csv
+# - core025_separator_summary__2026-04-03_v10.csv
 #
 # LAB Walk-Forward:
-# - core025_lab_per_event__2026-04-03_v9.csv
-# - core025_lab_per_date__2026-04-03_v9.csv
-# - core025_lab_per_stream__2026-04-03_v9.csv
-# - core025_lab_summary__2026-04-03_v9.csv
+# - core025_lab_per_event__2026-04-03_v10.csv
+# - core025_lab_per_date__2026-04-03_v10.csv
+# - core025_lab_per_stream__2026-04-03_v10.csv
+# - core025_lab_summary__2026-04-03_v10.csv
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ import pandas as pd
 import streamlit as st
 
 CORE025 = ["0025", "0225", "0255"]
-BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-03_v9"
+BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-03_v10"
 DEFAULT_SKIP_SCORE_CUTOFF = 0.515465
 
 
@@ -691,6 +691,10 @@ def classify_dominance_state(
         and rule_gap_top12 >= float(dominant_rule_gap_min)
         and blended_alignment_ratio >= float(dominant_alignment_min)
     ):
+        return "DOMINANT"
+
+    # V10 soft-dominant expansion: promote strong middle-tier rows out of WEAK
+    if gap >= 0.55 and blended_alignment_ratio >= 0.58:
         return "DOMINANT"
 
     if gap <= float(contested_gap_max) or ratio >= float(contested_ratio_min):
@@ -1354,15 +1358,15 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         min_compression_factor = st.slider("Minimum compression factor", min_value=0.05, max_value=1.00, value=0.30, step=0.01)
 
         st.header("Dominance thresholds")
-        dominant_gap_strict = st.slider("Strict dominant gap threshold", min_value=0.00, max_value=2.00, value=0.75, step=0.01)
+        dominant_gap_strict = st.slider("Strict dominant gap threshold", min_value=0.00, max_value=2.00, value=0.65, step=0.01)
         dominant_ratio_max_strict = st.slider("Strict dominant max ratio", min_value=0.50, max_value=1.00, value=0.65, step=0.01)
-        dominant_exclusivity_min = st.slider("Strict dominant min exclusivity", min_value=0.00, max_value=1.00, value=0.28, step=0.01)
+        dominant_exclusivity_min = st.slider("Strict dominant min exclusivity", min_value=0.00, max_value=1.00, value=0.24, step=0.01)
         dominant_rule_gap_min = st.slider("Strict dominant min rule-gap", min_value=0.00, max_value=10.00, value=3.00, step=0.10)
-        dominant_alignment_min = st.slider("Strict dominant min alignment", min_value=0.00, max_value=1.00, value=0.65, step=0.01)
+        dominant_alignment_min = st.slider("Strict dominant min alignment", min_value=0.00, max_value=1.00, value=0.60, step=0.01)
 
         st.header("Top2 widening controls")
         contested_gap_max = st.slider("Contested gap max", min_value=0.00, max_value=2.00, value=0.12, step=0.01)
-        contested_ratio_min = st.slider("Contested ratio min", min_value=0.50, max_value=1.00, value=0.95, step=0.01)
+        contested_ratio_min = st.slider("Contested ratio min", min_value=0.50, max_value=1.00, value=0.97, step=0.01)
         top2_ratio_trigger = st.slider("Top2 widen ratio trigger", min_value=0.50, max_value=1.00, value=0.97, step=0.01)
         top2_gap_trigger = st.slider("Top2 widen gap trigger", min_value=0.00, max_value=2.00, value=0.08, step=0.01)
         top2_alignment_ceiling = st.slider("Top2 widen max alignment", min_value=0.00, max_value=1.00, value=0.62, step=0.01)
@@ -1486,15 +1490,15 @@ def render_regular_results(out: pd.DataFrame, summary: pd.DataFrame, rows_to_sho
     st.dataframe(out[present_cols].head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_separator_ranked_playlist__2026-04-03_v9.csv",
+        "Download core025_separator_ranked_playlist__2026-04-03_v10.csv",
         data=out.to_csv(index=False),
-        file_name="core025_separator_ranked_playlist__2026-04-03_v9.csv",
+        file_name="core025_separator_ranked_playlist__2026-04-03_v10.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_separator_summary__2026-04-03_v9.csv",
+        "Download core025_separator_summary__2026-04-03_v10.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_separator_summary__2026-04-03_v9.csv",
+        file_name="core025_separator_summary__2026-04-03_v10.csv",
         mime="text/csv",
     )
 
@@ -1516,27 +1520,27 @@ def render_lab_results(per_event: pd.DataFrame, per_date: pd.DataFrame, per_stre
     st.dataframe(per_stream.head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_lab_per_event__2026-04-03_v9.csv",
+        "Download core025_lab_per_event__2026-04-03_v10.csv",
         data=per_event.to_csv(index=False),
-        file_name="core025_lab_per_event__2026-04-03_v9.csv",
+        file_name="core025_lab_per_event__2026-04-03_v10.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_per_date__2026-04-03_v9.csv",
+        "Download core025_lab_per_date__2026-04-03_v10.csv",
         data=per_date.to_csv(index=False),
-        file_name="core025_lab_per_date__2026-04-03_v9.csv",
+        file_name="core025_lab_per_date__2026-04-03_v10.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_per_stream__2026-04-03_v9.csv",
+        "Download core025_lab_per_stream__2026-04-03_v10.csv",
         data=per_stream.to_csv(index=False),
-        file_name="core025_lab_per_stream__2026-04-03_v9.csv",
+        file_name="core025_lab_per_stream__2026-04-03_v10.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_summary__2026-04-03_v9.csv",
+        "Download core025_lab_summary__2026-04-03_v10.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_lab_summary__2026-04-03_v9.csv",
+        file_name="core025_lab_summary__2026-04-03_v10.csv",
         mime="text/csv",
     )
 
@@ -1583,13 +1587,13 @@ def main():
         if st.button("Run Regular Playlist", type="primary"):
             with st.spinner("Running regular playlist..."):
                 out, summary = run_regular_playlist(hist, surv, separator_rules, params)
-                st.session_state["core025_regular_out_v9"] = out
-                st.session_state["core025_regular_summary_v9"] = summary
+                st.session_state["core025_regular_out_v10"] = out
+                st.session_state["core025_regular_summary_v10"] = summary
 
-        if "core025_regular_out_v9" in st.session_state and "core025_regular_summary_v9" in st.session_state:
+        if "core025_regular_out_v10" in st.session_state and "core025_regular_summary_v10" in st.session_state:
             render_regular_results(
-                st.session_state["core025_regular_out_v9"],
-                st.session_state["core025_regular_summary_v9"],
+                st.session_state["core025_regular_out_v10"],
+                st.session_state["core025_regular_summary_v10"],
                 rows_to_show,
             )
 
@@ -1604,28 +1608,28 @@ def main():
                     non_core = int(summary.loc[summary["metric"] == "non_core025_transitions_skipped", "value"].iloc[0]) if not summary.empty and (summary["metric"] == "non_core025_transitions_skipped").any() else 0
                     total_seen = int(summary.loc[summary["metric"] == "total_transitions_seen", "value"].iloc[0]) if not summary.empty and (summary["metric"] == "total_transitions_seen").any() else 0
                     per_date, per_stream, by_mode, summary = summarize_lab(per_event, total_seen, non_core)
-                st.session_state["core025_lab_per_event_v9"] = per_event
-                st.session_state["core025_lab_per_date_v9"] = per_date
-                st.session_state["core025_lab_per_stream_v9"] = per_stream
-                st.session_state["core025_lab_by_mode_v9"] = by_mode
-                st.session_state["core025_lab_summary_v9"] = summary
+                st.session_state["core025_lab_per_event_v10"] = per_event
+                st.session_state["core025_lab_per_date_v10"] = per_date
+                st.session_state["core025_lab_per_stream_v10"] = per_stream
+                st.session_state["core025_lab_by_mode_v10"] = by_mode
+                st.session_state["core025_lab_summary_v10"] = summary
 
         if all(
             key in st.session_state
             for key in [
-                "core025_lab_per_event_v9",
-                "core025_lab_per_date_v9",
-                "core025_lab_per_stream_v9",
-                "core025_lab_by_mode_v9",
-                "core025_lab_summary_v9",
+                "core025_lab_per_event_v10",
+                "core025_lab_per_date_v10",
+                "core025_lab_per_stream_v10",
+                "core025_lab_by_mode_v10",
+                "core025_lab_summary_v10",
             ]
         ):
             render_lab_results(
-                st.session_state["core025_lab_per_event_v9"],
-                st.session_state["core025_lab_per_date_v9"],
-                st.session_state["core025_lab_per_stream_v9"],
-                st.session_state["core025_lab_by_mode_v9"],
-                st.session_state["core025_lab_summary_v9"],
+                st.session_state["core025_lab_per_event_v10"],
+                st.session_state["core025_lab_per_date_v10"],
+                st.session_state["core025_lab_per_stream_v10"],
+                st.session_state["core025_lab_by_mode_v10"],
+                st.session_state["core025_lab_summary_v10"],
                 rows_to_show,
             )
 
