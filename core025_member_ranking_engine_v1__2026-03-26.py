@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# core025_separator_engine_plus_lab_walkforward__2026-04-03_v11.py
+# core025_separator_engine_plus_lab_walkforward__2026-04-03_v12.py
 #
-# BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-03_v11
+# BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-03_v12
 #
 # Full file. No placeholders.
 #
@@ -31,14 +31,14 @@
 # Outputs
 # -------
 # Regular Run:
-# - core025_separator_ranked_playlist__2026-04-03_v11.csv
-# - core025_separator_summary__2026-04-03_v11.csv
+# - core025_separator_ranked_playlist__2026-04-03_v12.csv
+# - core025_separator_summary__2026-04-03_v12.csv
 #
 # LAB Walk-Forward:
-# - core025_lab_per_event__2026-04-03_v11.csv
-# - core025_lab_per_date__2026-04-03_v11.csv
-# - core025_lab_per_stream__2026-04-03_v11.csv
-# - core025_lab_summary__2026-04-03_v11.csv
+# - core025_lab_per_event__2026-04-03_v12.csv
+# - core025_lab_per_date__2026-04-03_v12.csv
+# - core025_lab_per_stream__2026-04-03_v12.csv
+# - core025_lab_summary__2026-04-03_v12.csv
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ import pandas as pd
 import streamlit as st
 
 CORE025 = ["0025", "0225", "0255"]
-BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-03_v11"
+BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-03_v12"
 DEFAULT_SKIP_SCORE_CUTOFF = 0.515465
 
 
@@ -752,11 +752,9 @@ def decide_play_mode(
     if dominance_state == "DOMINANT" and member_gate_passed:
         return "PLAY_TOP1", f"Validated dominant Top1 | {member_gate_reason}"
 
-    if member_gate_passed and ratio <= 0.92 and blended_alignment_ratio >= 0.52:
+    if member_gate_passed and ratio <= 0.93 and blended_alignment_ratio >= 0.50:
         return "PLAY_TOP1", f"Member-specific Top1 promotion | {member_gate_reason}"
 
-    if gap >= 0.70:
-        return "PLAY_TOP1", "Strong dominant gap forced Top1"
 
     if ratio >= float(top2_ratio_trigger) and blended_alignment_ratio < float(top2_alignment_ceiling):
         return "PLAY_TOP2", "Tight ratio with weak alignment widened to Top1+Top2"
@@ -1370,9 +1368,9 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         st.header("Top2 widening controls")
         contested_gap_max = st.slider("Contested gap max", min_value=0.00, max_value=2.00, value=0.12, step=0.01)
         contested_ratio_min = st.slider("Contested ratio min", min_value=0.50, max_value=1.00, value=0.97, step=0.01)
-        top2_ratio_trigger = st.slider("Top2 widen ratio trigger", min_value=0.50, max_value=1.00, value=0.98, step=0.01)
+        top2_ratio_trigger = st.slider("Top2 widen ratio trigger", min_value=0.50, max_value=1.00, value=0.97, step=0.01)
         top2_gap_trigger = st.slider("Top2 widen gap trigger", min_value=0.00, max_value=2.00, value=0.08, step=0.01)
-        top2_alignment_ceiling = st.slider("Top2 widen max alignment", min_value=0.00, max_value=1.00, value=0.58, step=0.01)
+        top2_alignment_ceiling = st.slider("Top2 widen max alignment", min_value=0.00, max_value=1.00, value=0.62, step=0.01)
         top2_exclusivity_ceiling = st.slider("Top2 widen max exclusivity", min_value=0.00, max_value=1.00, value=0.22, step=0.01)
 
         st.header("Member-specific Top1 gates")
@@ -1397,8 +1395,8 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         m0225_boost_alignment_min = st.slider("0225 boost if alignment at least", min_value=0.00, max_value=1.00, value=0.60, step=0.01)
         m0225_boost_multiplier = st.slider("0225 score multiplier on clean pocket", min_value=0.80, max_value=1.30, value=1.05, step=0.01)
 
-        m0255_boost_multiplier_gap = st.slider("0255 score multiplier on boost-gap signal", min_value=0.80, max_value=1.50, value=1.25, step=0.01)
-        m0255_boost_multiplier_align = st.slider("0255 score multiplier on alignment signal", min_value=0.80, max_value=1.50, value=1.20, step=0.01)
+        m0255_boost_multiplier_gap = st.slider("0255 score multiplier on boost-gap signal", min_value=0.80, max_value=1.50, value=1.28, step=0.01)
+        m0255_boost_multiplier_align = st.slider("0255 score multiplier on alignment signal", min_value=0.80, max_value=1.50, value=1.22, step=0.01)
 
         st.header("Weak-row control")
         weak_top1_score_floor = st.slider("Weak Top1 score floor", min_value=0.00, max_value=5.00, value=0.20, step=0.01)
@@ -1493,15 +1491,15 @@ def render_regular_results(out: pd.DataFrame, summary: pd.DataFrame, rows_to_sho
     st.dataframe(out[present_cols].head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_separator_ranked_playlist__2026-04-03_v11.csv",
+        "Download core025_separator_ranked_playlist__2026-04-03_v12.csv",
         data=out.to_csv(index=False),
-        file_name="core025_separator_ranked_playlist__2026-04-03_v11.csv",
+        file_name="core025_separator_ranked_playlist__2026-04-03_v12.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_separator_summary__2026-04-03_v11.csv",
+        "Download core025_separator_summary__2026-04-03_v12.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_separator_summary__2026-04-03_v11.csv",
+        file_name="core025_separator_summary__2026-04-03_v12.csv",
         mime="text/csv",
     )
 
@@ -1523,27 +1521,27 @@ def render_lab_results(per_event: pd.DataFrame, per_date: pd.DataFrame, per_stre
     st.dataframe(per_stream.head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_lab_per_event__2026-04-03_v11.csv",
+        "Download core025_lab_per_event__2026-04-03_v12.csv",
         data=per_event.to_csv(index=False),
-        file_name="core025_lab_per_event__2026-04-03_v11.csv",
+        file_name="core025_lab_per_event__2026-04-03_v12.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_per_date__2026-04-03_v11.csv",
+        "Download core025_lab_per_date__2026-04-03_v12.csv",
         data=per_date.to_csv(index=False),
-        file_name="core025_lab_per_date__2026-04-03_v11.csv",
+        file_name="core025_lab_per_date__2026-04-03_v12.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_per_stream__2026-04-03_v11.csv",
+        "Download core025_lab_per_stream__2026-04-03_v12.csv",
         data=per_stream.to_csv(index=False),
-        file_name="core025_lab_per_stream__2026-04-03_v11.csv",
+        file_name="core025_lab_per_stream__2026-04-03_v12.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_summary__2026-04-03_v11.csv",
+        "Download core025_lab_summary__2026-04-03_v12.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_lab_summary__2026-04-03_v11.csv",
+        file_name="core025_lab_summary__2026-04-03_v12.csv",
         mime="text/csv",
     )
 
@@ -1590,13 +1588,13 @@ def main():
         if st.button("Run Regular Playlist", type="primary"):
             with st.spinner("Running regular playlist..."):
                 out, summary = run_regular_playlist(hist, surv, separator_rules, params)
-                st.session_state["core025_regular_out_v11"] = out
-                st.session_state["core025_regular_summary_v11"] = summary
+                st.session_state["core025_regular_out_v12"] = out
+                st.session_state["core025_regular_summary_v12"] = summary
 
-        if "core025_regular_out_v11" in st.session_state and "core025_regular_summary_v11" in st.session_state:
+        if "core025_regular_out_v12" in st.session_state and "core025_regular_summary_v12" in st.session_state:
             render_regular_results(
-                st.session_state["core025_regular_out_v11"],
-                st.session_state["core025_regular_summary_v11"],
+                st.session_state["core025_regular_out_v12"],
+                st.session_state["core025_regular_summary_v12"],
                 rows_to_show,
             )
 
@@ -1611,28 +1609,28 @@ def main():
                     non_core = int(summary.loc[summary["metric"] == "non_core025_transitions_skipped", "value"].iloc[0]) if not summary.empty and (summary["metric"] == "non_core025_transitions_skipped").any() else 0
                     total_seen = int(summary.loc[summary["metric"] == "total_transitions_seen", "value"].iloc[0]) if not summary.empty and (summary["metric"] == "total_transitions_seen").any() else 0
                     per_date, per_stream, by_mode, summary = summarize_lab(per_event, total_seen, non_core)
-                st.session_state["core025_lab_per_event_v11"] = per_event
-                st.session_state["core025_lab_per_date_v11"] = per_date
-                st.session_state["core025_lab_per_stream_v11"] = per_stream
-                st.session_state["core025_lab_by_mode_v11"] = by_mode
-                st.session_state["core025_lab_summary_v11"] = summary
+                st.session_state["core025_lab_per_event_v12"] = per_event
+                st.session_state["core025_lab_per_date_v12"] = per_date
+                st.session_state["core025_lab_per_stream_v12"] = per_stream
+                st.session_state["core025_lab_by_mode_v12"] = by_mode
+                st.session_state["core025_lab_summary_v12"] = summary
 
         if all(
             key in st.session_state
             for key in [
-                "core025_lab_per_event_v11",
-                "core025_lab_per_date_v11",
-                "core025_lab_per_stream_v11",
-                "core025_lab_by_mode_v11",
-                "core025_lab_summary_v11",
+                "core025_lab_per_event_v12",
+                "core025_lab_per_date_v12",
+                "core025_lab_per_stream_v12",
+                "core025_lab_by_mode_v12",
+                "core025_lab_summary_v12",
             ]
         ):
             render_lab_results(
-                st.session_state["core025_lab_per_event_v11"],
-                st.session_state["core025_lab_per_date_v11"],
-                st.session_state["core025_lab_per_stream_v11"],
-                st.session_state["core025_lab_by_mode_v11"],
-                st.session_state["core025_lab_summary_v11"],
+                st.session_state["core025_lab_per_event_v12"],
+                st.session_state["core025_lab_per_date_v12"],
+                st.session_state["core025_lab_per_stream_v12"],
+                st.session_state["core025_lab_by_mode_v12"],
+                st.session_state["core025_lab_summary_v12"],
                 rows_to_show,
             )
 
