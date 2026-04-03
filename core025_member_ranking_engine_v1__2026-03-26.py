@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# core025_separator_engine_plus_lab_walkforward__2026-04-01_v4.py
+# core025_separator_engine_plus_lab_walkforward__2026-04-02_v5.py
 #
-# BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-01_v4
+# BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-02_v5
 #
 # Full file. No placeholders.
 #
@@ -11,27 +11,30 @@
 # 1) Regular Run mode for current survivor playlist ranking
 # 2) Optional LAB mode for full no-lookahead walk-forward validation
 #
-# This version keeps the prior fixes:
-# - LAB scoring only on true Core025 winner events
-# - calibrated rule-count normalization and cross-member compression
-# - validated dominance thresholds and false-dominance guard
+# This version is explicitly optimized for the locked goal:
+# - increase Top1 accuracy
+# - avoid regressions that merely increase Top2 usage
+# - use Top2 only when it is truly necessary
 #
-# And adds the final rule-alignment upgrade:
-# - dominance now requires rule alignment, not just raw rule advantage
-# - rows with strong-looking but poorly aligned support widen to Top1+Top2
-# - alignment diagnostics are exposed in outputs and LAB
+# Design updates in this version:
+# - keeps LAB scoring only on true Core025 winner events
+# - keeps calibrated rule-count normalization and cross-member compression
+# - keeps validated dominance thresholds and alignment diagnostics
+# - removes over-defensive widening behavior that was increasing Top2 usage
+# - adds a Top1 confidence recovery path for safe-but-undertrusted rows
+# - narrows Top2 widening to tighter, lower-alignment pockets only
 #
 # Outputs
 # -------
 # Regular Run:
-# - core025_separator_ranked_playlist__2026-04-01_v4.csv
-# - core025_separator_summary__2026-04-01_v4.csv
+# - core025_separator_ranked_playlist__2026-04-02_v5.csv
+# - core025_separator_summary__2026-04-02_v5.csv
 #
 # LAB Walk-Forward:
-# - core025_lab_per_event__2026-04-01_v4.csv
-# - core025_lab_per_date__2026-04-01_v4.csv
-# - core025_lab_per_stream__2026-04-01_v4.csv
-# - core025_lab_summary__2026-04-01_v4.csv
+# - core025_lab_per_event__2026-04-02_v5.csv
+# - core025_lab_per_date__2026-04-02_v5.csv
+# - core025_lab_per_stream__2026-04-02_v5.csv
+# - core025_lab_summary__2026-04-02_v5.csv
 
 from __future__ import annotations
 
@@ -45,7 +48,7 @@ import pandas as pd
 import streamlit as st
 
 CORE025 = ["0025", "0225", "0255"]
-BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-01_v4"
+BUILD_MARKER = "BUILD: core025_separator_engine_plus_lab_walkforward__2026-04-02_v5"
 DEFAULT_SKIP_SCORE_CUTOFF = 0.515465
 
 
@@ -436,7 +439,7 @@ def match_rule(row: pd.Series, rule: Dict[str, object]) -> Tuple[bool, int, int,
 
 
 # -----------------------------------------------------------------------------
-# Separator scoring and validated dominance logic
+# Separator scoring and Top1-first play logic
 # -----------------------------------------------------------------------------
 
 def apply_separator_rules(
@@ -563,21 +566,16 @@ def compress_member_scores(
     return compressed, diagnostics
 
 
-def compute_rule_alignment(
-    top1_rule_count: int,
-    top2_rule_count: int,
-    top1_boost: float,
-    top2_boost: float,
-) -> Dict[str, float]:
+def compute_alignment(top1_rule_count: int, top2_rule_count: int, top1_boost: float, top2_boost: float) -> Dict[str, float]:
     total_rules = max(1, int(top1_rule_count) + int(top2_rule_count))
     total_boost = max(1e-9, float(top1_boost) + float(top2_boost))
     rule_alignment_ratio = float(top1_rule_count) / float(total_rules)
     boost_alignment_ratio = float(top1_boost) / float(total_boost)
-    blended_alignment = (rule_alignment_ratio * 0.50) + (boost_alignment_ratio * 0.50)
+    blended_alignment_ratio = (rule_alignment_ratio * 0.50) + (boost_alignment_ratio * 0.50)
     return {
         "rule_alignment_ratio": rule_alignment_ratio,
         "boost_alignment_ratio": boost_alignment_ratio,
-        "blended_alignment_ratio": blended_alignment,
+        "blended_alignment_ratio": blended_alignment_ratio,
     }
 
 
@@ -620,34 +618,50 @@ def decide_play_mode(
     weak_top1_score_floor: float,
     top2_ratio_trigger: float,
     top2_gap_trigger: float,
+    top2_alignment_ceiling: float,
+    top2_exclusivity_ceiling: float,
     fake_dominance_gap_floor: float,
     fake_dominance_ratio_ceiling: float,
     fake_dominance_exclusivity_floor: float,
-    weak_alignment_floor: float,
+    fake_dominance_alignment_ceiling: float,
+    confidence_recovery_gap_min: float,
+    confidence_recovery_ratio_max: float,
+    confidence_recovery_exclusivity_min: float,
+    confidence_recovery_alignment_min: float,
 ) -> Tuple[str, str]:
     if top1_score < float(weak_top1_score_floor):
         return "SKIP", "Top1 score too weak"
 
-    if blended_alignment_ratio < float(weak_alignment_floor):
-        return "PLAY_TOP2", "Low rule alignment widened to Top1+Top2"
-
     if dominance_state == "DOMINANT":
-        return "PLAY_TOP1", "Validated dominant Top1 with aligned support"
+        return "PLAY_TOP1", "Validated dominant Top1"
+
+    if (
+        dominance_state == "WEAK"
+        and gap >= float(confidence_recovery_gap_min)
+        and ratio <= float(confidence_recovery_ratio_max)
+        and exclusivity_strength >= float(confidence_recovery_exclusivity_min)
+        and blended_alignment_ratio >= float(confidence_recovery_alignment_min)
+    ):
+        return "PLAY_TOP1", "Recovered safe Top1 confidence"
 
     if (
         gap >= float(fake_dominance_gap_floor)
         and ratio < float(fake_dominance_ratio_ceiling)
         and exclusivity_strength < float(fake_dominance_exclusivity_floor)
+        and blended_alignment_ratio < float(fake_dominance_alignment_ceiling)
     ):
         return "PLAY_TOP2", "False-dominance guard widened to Top1+Top2"
 
     if dominance_state == "CONTESTED":
         return "PLAY_TOP2", "Contested row"
 
-    if ratio >= float(top2_ratio_trigger) or gap <= float(top2_gap_trigger):
-        return "PLAY_TOP2", "Tight separation widened to Top1+Top2"
+    if ratio >= float(top2_ratio_trigger) and blended_alignment_ratio < float(top2_alignment_ceiling):
+        return "PLAY_TOP2", "Tight ratio with weak alignment widened to Top1+Top2"
 
-    return "PLAY_TOP1", "Weak-but-playable Top1"
+    if gap <= float(top2_gap_trigger) and exclusivity_strength <= float(top2_exclusivity_ceiling):
+        return "PLAY_TOP2", "Small gap with weak exclusivity widened to Top1+Top2"
+
+    return "PLAY_TOP1", "Top1-first default"
 
 
 def rank_members_from_maps(
@@ -675,10 +689,16 @@ def rank_members_from_maps(
     contested_ratio_min: float,
     top2_ratio_trigger: float,
     top2_gap_trigger: float,
+    top2_alignment_ceiling: float,
+    top2_exclusivity_ceiling: float,
     fake_dominance_gap_floor: float,
     fake_dominance_ratio_ceiling: float,
     fake_dominance_exclusivity_floor: float,
-    weak_alignment_floor: float,
+    fake_dominance_alignment_ceiling: float,
+    confidence_recovery_gap_min: float,
+    confidence_recovery_ratio_max: float,
+    confidence_recovery_exclusivity_min: float,
+    confidence_recovery_alignment_min: float,
 ) -> Dict[str, object]:
     base = baseline_scores_from_maps(row, maps, min_stream_history=int(min_stream_history))
     boosts, fired_counts, fired_rules, near_misses, fail_counter, raw_boosts = apply_separator_rules(
@@ -728,7 +748,7 @@ def rank_members_from_maps(
     rule_margin = top1_rule_count - top2_rule_count
     boost_margin = top1_boost - top2_boost
 
-    alignment_diag = compute_rule_alignment(
+    alignment_diag = compute_alignment(
         top1_rule_count=top1_rule_count,
         top2_rule_count=top2_rule_count,
         top1_boost=top1_boost,
@@ -760,10 +780,16 @@ def rank_members_from_maps(
         weak_top1_score_floor=float(weak_top1_score_floor),
         top2_ratio_trigger=float(top2_ratio_trigger),
         top2_gap_trigger=float(top2_gap_trigger),
+        top2_alignment_ceiling=float(top2_alignment_ceiling),
+        top2_exclusivity_ceiling=float(top2_exclusivity_ceiling),
         fake_dominance_gap_floor=float(fake_dominance_gap_floor),
         fake_dominance_ratio_ceiling=float(fake_dominance_ratio_ceiling),
         fake_dominance_exclusivity_floor=float(fake_dominance_exclusivity_floor),
-        weak_alignment_floor=float(weak_alignment_floor),
+        fake_dominance_alignment_ceiling=float(fake_dominance_alignment_ceiling),
+        confidence_recovery_gap_min=float(confidence_recovery_gap_min),
+        confidence_recovery_ratio_max=float(confidence_recovery_ratio_max),
+        confidence_recovery_exclusivity_min=float(confidence_recovery_exclusivity_min),
+        confidence_recovery_alignment_min=float(confidence_recovery_alignment_min),
     )
 
     near_text = " || ".join(
@@ -993,10 +1019,16 @@ def run_regular_playlist(
             contested_ratio_min=float(params["contested_ratio_min"]),
             top2_ratio_trigger=float(params["top2_ratio_trigger"]),
             top2_gap_trigger=float(params["top2_gap_trigger"]),
+            top2_alignment_ceiling=float(params["top2_alignment_ceiling"]),
+            top2_exclusivity_ceiling=float(params["top2_exclusivity_ceiling"]),
             fake_dominance_gap_floor=float(params["fake_dominance_gap_floor"]),
             fake_dominance_ratio_ceiling=float(params["fake_dominance_ratio_ceiling"]),
             fake_dominance_exclusivity_floor=float(params["fake_dominance_exclusivity_floor"]),
-            weak_alignment_floor=float(params["weak_alignment_floor"]),
+            fake_dominance_alignment_ceiling=float(params["fake_dominance_alignment_ceiling"]),
+            confidence_recovery_gap_min=float(params["confidence_recovery_gap_min"]),
+            confidence_recovery_ratio_max=float(params["confidence_recovery_ratio_max"]),
+            confidence_recovery_exclusivity_min=float(params["confidence_recovery_exclusivity_min"]),
+            confidence_recovery_alignment_min=float(params["confidence_recovery_alignment_min"]),
         )
         rows.append({"stream": row["stream"], "seed": row["seed"], **ranked})
 
@@ -1062,10 +1094,16 @@ def run_lab_walkforward(
             contested_ratio_min=float(params["contested_ratio_min"]),
             top2_ratio_trigger=float(params["top2_ratio_trigger"]),
             top2_gap_trigger=float(params["top2_gap_trigger"]),
+            top2_alignment_ceiling=float(params["top2_alignment_ceiling"]),
+            top2_exclusivity_ceiling=float(params["top2_exclusivity_ceiling"]),
             fake_dominance_gap_floor=float(params["fake_dominance_gap_floor"]),
             fake_dominance_ratio_ceiling=float(params["fake_dominance_ratio_ceiling"]),
             fake_dominance_exclusivity_floor=float(params["fake_dominance_exclusivity_floor"]),
-            weak_alignment_floor=float(params["weak_alignment_floor"]),
+            fake_dominance_alignment_ceiling=float(params["fake_dominance_alignment_ceiling"]),
+            confidence_recovery_gap_min=float(params["confidence_recovery_gap_min"]),
+            confidence_recovery_ratio_max=float(params["confidence_recovery_ratio_max"]),
+            confidence_recovery_exclusivity_min=float(params["confidence_recovery_exclusivity_min"]),
+            confidence_recovery_alignment_min=float(params["confidence_recovery_alignment_min"]),
         )
 
         if winner_member is None:
@@ -1148,17 +1186,25 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         dominant_rule_gap_min = st.slider("Strict dominant min rule-gap", min_value=0.00, max_value=10.00, value=3.00, step=0.10)
         dominant_alignment_min = st.slider("Strict dominant min alignment", min_value=0.00, max_value=1.00, value=0.65, step=0.01)
 
-        st.header("Contested / Top2 triggers")
-        contested_gap_max = st.slider("Contested gap max", min_value=0.00, max_value=2.00, value=0.15, step=0.01)
-        contested_ratio_min = st.slider("Contested ratio min", min_value=0.50, max_value=1.00, value=0.93, step=0.01)
-        top2_ratio_trigger = st.slider("Top2 widen ratio trigger", min_value=0.50, max_value=1.00, value=0.92, step=0.01)
-        top2_gap_trigger = st.slider("Top2 widen gap trigger", min_value=0.00, max_value=2.00, value=0.18, step=0.01)
+        st.header("Top1-first widening controls")
+        contested_gap_max = st.slider("Contested gap max", min_value=0.00, max_value=2.00, value=0.12, step=0.01)
+        contested_ratio_min = st.slider("Contested ratio min", min_value=0.50, max_value=1.00, value=0.95, step=0.01)
+        top2_ratio_trigger = st.slider("Top2 widen ratio trigger", min_value=0.50, max_value=1.00, value=0.95, step=0.01)
+        top2_gap_trigger = st.slider("Top2 widen gap trigger", min_value=0.00, max_value=2.00, value=0.12, step=0.01)
+        top2_alignment_ceiling = st.slider("Top2 widen max alignment", min_value=0.00, max_value=1.00, value=0.62, step=0.01)
+        top2_exclusivity_ceiling = st.slider("Top2 widen max exclusivity", min_value=0.00, max_value=1.00, value=0.22, step=0.01)
 
         st.header("False-dominance guard")
         fake_dominance_gap_floor = st.slider("False-dominance gap floor", min_value=0.00, max_value=2.00, value=0.20, step=0.01)
         fake_dominance_ratio_ceiling = st.slider("False-dominance ratio ceiling", min_value=0.50, max_value=1.00, value=0.80, step=0.01)
         fake_dominance_exclusivity_floor = st.slider("False-dominance exclusivity floor", min_value=0.00, max_value=1.00, value=0.28, step=0.01)
-        weak_alignment_floor = st.slider("Weak alignment widen floor", min_value=0.00, max_value=1.00, value=0.60, step=0.01)
+        fake_dominance_alignment_ceiling = st.slider("False-dominance max alignment", min_value=0.00, max_value=1.00, value=0.62, step=0.01)
+
+        st.header("Top1 confidence recovery")
+        confidence_recovery_gap_min = st.slider("Confidence recovery min gap", min_value=0.00, max_value=2.00, value=0.18, step=0.01)
+        confidence_recovery_ratio_max = st.slider("Confidence recovery max ratio", min_value=0.50, max_value=1.00, value=0.82, step=0.01)
+        confidence_recovery_exclusivity_min = st.slider("Confidence recovery min exclusivity", min_value=0.00, max_value=1.00, value=0.22, step=0.01)
+        confidence_recovery_alignment_min = st.slider("Confidence recovery min alignment", min_value=0.00, max_value=1.00, value=0.66, step=0.01)
 
         st.header("Weak-row control")
         weak_top1_score_floor = st.slider("Weak Top1 score floor", min_value=0.00, max_value=5.00, value=0.20, step=0.01)
@@ -1188,10 +1234,16 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         "contested_ratio_min": float(contested_ratio_min),
         "top2_ratio_trigger": float(top2_ratio_trigger),
         "top2_gap_trigger": float(top2_gap_trigger),
+        "top2_alignment_ceiling": float(top2_alignment_ceiling),
+        "top2_exclusivity_ceiling": float(top2_exclusivity_ceiling),
         "fake_dominance_gap_floor": float(fake_dominance_gap_floor),
         "fake_dominance_ratio_ceiling": float(fake_dominance_ratio_ceiling),
         "fake_dominance_exclusivity_floor": float(fake_dominance_exclusivity_floor),
-        "weak_alignment_floor": float(weak_alignment_floor),
+        "fake_dominance_alignment_ceiling": float(fake_dominance_alignment_ceiling),
+        "confidence_recovery_gap_min": float(confidence_recovery_gap_min),
+        "confidence_recovery_ratio_max": float(confidence_recovery_ratio_max),
+        "confidence_recovery_exclusivity_min": float(confidence_recovery_exclusivity_min),
+        "confidence_recovery_alignment_min": float(confidence_recovery_alignment_min),
         "weak_top1_score_floor": float(weak_top1_score_floor),
         "rows_to_show": int(rows_to_show),
         "lab_max_events": int(lab_max_events),
@@ -1240,15 +1292,15 @@ def render_regular_results(out: pd.DataFrame, summary: pd.DataFrame, rows_to_sho
     st.dataframe(out[present_cols].head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_separator_ranked_playlist__2026-04-01_v4.csv",
+        "Download core025_separator_ranked_playlist__2026-04-02_v5.csv",
         data=out.to_csv(index=False),
-        file_name="core025_separator_ranked_playlist__2026-04-01_v4.csv",
+        file_name="core025_separator_ranked_playlist__2026-04-02_v5.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_separator_summary__2026-04-01_v4.csv",
+        "Download core025_separator_summary__2026-04-02_v5.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_separator_summary__2026-04-01_v4.csv",
+        file_name="core025_separator_summary__2026-04-02_v5.csv",
         mime="text/csv",
     )
 
@@ -1270,27 +1322,27 @@ def render_lab_results(per_event: pd.DataFrame, per_date: pd.DataFrame, per_stre
     st.dataframe(per_stream.head(int(rows_to_show)), use_container_width=True)
 
     st.download_button(
-        "Download core025_lab_per_event__2026-04-01_v4.csv",
+        "Download core025_lab_per_event__2026-04-02_v5.csv",
         data=per_event.to_csv(index=False),
-        file_name="core025_lab_per_event__2026-04-01_v4.csv",
+        file_name="core025_lab_per_event__2026-04-02_v5.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_per_date__2026-04-01_v4.csv",
+        "Download core025_lab_per_date__2026-04-02_v5.csv",
         data=per_date.to_csv(index=False),
-        file_name="core025_lab_per_date__2026-04-01_v4.csv",
+        file_name="core025_lab_per_date__2026-04-02_v5.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_per_stream__2026-04-01_v4.csv",
+        "Download core025_lab_per_stream__2026-04-02_v5.csv",
         data=per_stream.to_csv(index=False),
-        file_name="core025_lab_per_stream__2026-04-01_v4.csv",
+        file_name="core025_lab_per_stream__2026-04-02_v5.csv",
         mime="text/csv",
     )
     st.download_button(
-        "Download core025_lab_summary__2026-04-01_v4.csv",
+        "Download core025_lab_summary__2026-04-02_v5.csv",
         data=summary.to_csv(index=False),
-        file_name="core025_lab_summary__2026-04-01_v4.csv",
+        file_name="core025_lab_summary__2026-04-02_v5.csv",
         mime="text/csv",
     )
 
@@ -1337,13 +1389,13 @@ def main():
         if st.button("Run Regular Playlist", type="primary"):
             with st.spinner("Running regular playlist..."):
                 out, summary = run_regular_playlist(hist, surv, separator_rules, params)
-                st.session_state["core025_regular_out_v4"] = out
-                st.session_state["core025_regular_summary_v4"] = summary
+                st.session_state["core025_regular_out_v5"] = out
+                st.session_state["core025_regular_summary_v5"] = summary
 
-        if "core025_regular_out_v4" in st.session_state and "core025_regular_summary_v4" in st.session_state:
+        if "core025_regular_out_v5" in st.session_state and "core025_regular_summary_v5" in st.session_state:
             render_regular_results(
-                st.session_state["core025_regular_out_v4"],
-                st.session_state["core025_regular_summary_v4"],
+                st.session_state["core025_regular_out_v5"],
+                st.session_state["core025_regular_summary_v5"],
                 rows_to_show,
             )
 
@@ -1358,28 +1410,28 @@ def main():
                     non_core = int(summary.loc[summary["metric"] == "non_core025_transitions_skipped", "value"].iloc[0]) if not summary.empty and (summary["metric"] == "non_core025_transitions_skipped").any() else 0
                     total_seen = int(summary.loc[summary["metric"] == "total_transitions_seen", "value"].iloc[0]) if not summary.empty and (summary["metric"] == "total_transitions_seen").any() else 0
                     per_date, per_stream, by_mode, summary = summarize_lab(per_event, total_seen, non_core)
-                st.session_state["core025_lab_per_event_v4"] = per_event
-                st.session_state["core025_lab_per_date_v4"] = per_date
-                st.session_state["core025_lab_per_stream_v4"] = per_stream
-                st.session_state["core025_lab_by_mode_v4"] = by_mode
-                st.session_state["core025_lab_summary_v4"] = summary
+                st.session_state["core025_lab_per_event_v5"] = per_event
+                st.session_state["core025_lab_per_date_v5"] = per_date
+                st.session_state["core025_lab_per_stream_v5"] = per_stream
+                st.session_state["core025_lab_by_mode_v5"] = by_mode
+                st.session_state["core025_lab_summary_v5"] = summary
 
         if all(
             key in st.session_state
             for key in [
-                "core025_lab_per_event_v4",
-                "core025_lab_per_date_v4",
-                "core025_lab_per_stream_v4",
-                "core025_lab_by_mode_v4",
-                "core025_lab_summary_v4",
+                "core025_lab_per_event_v5",
+                "core025_lab_per_date_v5",
+                "core025_lab_per_stream_v5",
+                "core025_lab_by_mode_v5",
+                "core025_lab_summary_v5",
             ]
         ):
             render_lab_results(
-                st.session_state["core025_lab_per_event_v4"],
-                st.session_state["core025_lab_per_date_v4"],
-                st.session_state["core025_lab_per_stream_v4"],
-                st.session_state["core025_lab_by_mode_v4"],
-                st.session_state["core025_lab_summary_v4"],
+                st.session_state["core025_lab_per_event_v5"],
+                st.session_state["core025_lab_per_date_v5"],
+                st.session_state["core025_lab_per_stream_v5"],
+                st.session_state["core025_lab_by_mode_v5"],
+                st.session_state["core025_lab_summary_v5"],
                 rows_to_show,
             )
 
