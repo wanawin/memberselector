@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# core025_skip_plus_v14_combined_lab__2026-04-03_v1.py
+# core025_skip_plus_v14_combined_lab__2026-04-03_v2.py
 #
-# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v1
+# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v2
 #
 # Full file. No placeholders.
 #
@@ -44,7 +44,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v1"
+BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v2"
 CORE025 = ["0025", "0225", "0255"]
 CORE025_SET = set(CORE025)
 DIGITS = list(range(10))
@@ -851,14 +851,22 @@ def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str,
     }
 
 
-def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dict[str, object]], params: Dict[str, float]) -> Dict[str, pd.DataFrame]:
+def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dict[str, object]], params: Dict[str, float], progress_bar=None, status_box=None) -> Dict[str, pd.DataFrame]:
     main_history = prepare_history(history_df)
     transitions_all = build_transition_events(main_history).sort_values(["event_date", "stream_id", "seed"]).reset_index(drop=True)
+    max_lab_events = int(params.get("lab_max_events", 0))
+    if max_lab_events > 0 and len(transitions_all) > max_lab_events:
+        transitions_all = transitions_all.head(max_lab_events).copy().reset_index(drop=True)
+    total_events_to_process = len(transitions_all)
     maps = init_baseline_maps()
     rows = []
 
     for i in range(len(transitions_all)):
         current = transitions_all.iloc[i]
+        if progress_bar is not None and total_events_to_process > 0:
+            progress_bar.progress((i + 1) / total_events_to_process)
+        if status_box is not None and ((i + 1) % 10 == 0 or (i + 1) == total_events_to_process):
+            status_box.info(f"Processing combined walk-forward event {i + 1:,} of {total_events_to_process:,}...")
         past = transitions_all.iloc[:i].copy()
         winner_member = normalize_member_code(current["next_member"])
         if len(past) < 20 or winner_member is None:
@@ -961,6 +969,8 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
         {"metric": "avg_step1_skip_score", "value": float(per_event["step1_skip_score"].mean())},
         {"metric": "avg_survivors_per_day", "value": float(per_date["survivors"].mean())},
     ])
+    if status_box is not None:
+        status_box.success(f"Combined walk-forward completed: {len(per_event):,} scored events.")
     return {"per_event": per_event, "per_date": per_date, "per_stream": per_stream, "summary": summary}
 
 
@@ -1021,6 +1031,7 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         m0255_boost_multiplier_align = st.slider("0255 score multiplier on alignment signal", min_value=0.80, max_value=1.50, value=1.22, step=0.01)
         weak_top1_score_floor = st.slider("Weak Top1 score floor", min_value=0.00, max_value=5.00, value=0.20, step=0.01)
         rows_to_show = st.number_input("Rows to display", min_value=5, value=50, step=5)
+        lab_max_events = st.number_input("LAB max events (0 = all)", min_value=0, value=250, step=50)
     return locals()
 
 
@@ -1062,13 +1073,16 @@ def main():
             st.dataframe(out["play_survivors_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Step 2 final playlist")
             st.dataframe(out["playlist_df"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download play_survivors__2026-04-03_v1.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v1.csv", mime="text/csv")
-            st.download_button("Download final_ranked_playlist__2026-04-03_v1.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v1.csv", mime="text/csv")
-            st.download_button("Download skip_current_scored__2026-04-03_v1.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v1.csv", mime="text/csv")
+            st.download_button("Download play_survivors__2026-04-03_v2.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v2.csv", mime="text/csv")
+            st.download_button("Download final_ranked_playlist__2026-04-03_v2.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v2.csv", mime="text/csv")
+            st.download_button("Download skip_current_scored__2026-04-03_v2.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v2.csv", mime="text/csv")
     else:
         if st.button("Run Combined Walk-Forward LAB", type="primary"):
             with st.spinner("Running combined no-lookahead walk-forward..."):
-                out = combined_walkforward_lab(hist_df, separator_rules, params)
+                progress = st.progress(0.0)
+                status_box = st.empty()
+                out = combined_walkforward_lab(hist_df, separator_rules, params, progress_bar=progress, status_box=status_box)
+                progress.empty()
                 st.session_state["combined_lab_out_v1"] = out
         if "combined_lab_out_v1" in st.session_state:
             out = st.session_state["combined_lab_out_v1"]
@@ -1080,10 +1094,10 @@ def main():
             st.dataframe(out["per_date"].head(rows_to_show), use_container_width=True)
             st.subheader("Per-stream")
             st.dataframe(out["per_stream"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download combined_lab_per_event__2026-04-03_v1.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v1.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_date__2026-04-03_v1.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v1.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_stream__2026-04-03_v1.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v1.csv", mime="text/csv")
-            st.download_button("Download combined_lab_summary__2026-04-03_v1.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v1.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_event__2026-04-03_v2.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v2.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_date__2026-04-03_v2.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v2.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_stream__2026-04-03_v2.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v2.csv", mime="text/csv")
+            st.download_button("Download combined_lab_summary__2026-04-03_v2.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v2.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
