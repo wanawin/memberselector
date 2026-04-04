@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-# core025_skip_plus_v14_combined_lab__2026-04-03_v8.py
+# core025_skip_plus_v14_combined_lab__2026-04-03_v9.py
 #
-# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v8
+# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v9
 #
 # Full file. No placeholders.
 #
 # Combined Step 1 Skip Engine + Step 2 V14-like Core025 member engine.
 #
-# V8 = Top1 separation upgrade
+# V9 = member calibration upgrade
+# - keeps v8 Top1 separation
 # - keeps v7 skip-distribution fix
 # - keeps v6 skip-training toggle behavior
-# - strengthens Top1 commitment only inside Step 2 member separation
-# - reduces unnecessary Top2 widening
-# - adds explicit confidence diagnostics so Top1/Top2 decisions can be audited
+# - adds member-specific score calibration BEFORE final ranking
+# - adds member-specific calibration diagnostics so score physics can be audited
 #
 # Locked scoring definitions:
 # - Top1 win = only Top1 was played and Top1 won
@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v8"
+BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v9"
 CORE025 = ["0025", "0225", "0255"]
 CORE025_SET = set(CORE025)
 DIGITS = list(range(10))
@@ -442,8 +442,30 @@ class BaselineMaps:
     global_member_map: Counter
 
 
+@dataclass
+class CalibrationMaps:
+    stream_member_rate: Dict[str, Dict[str, float]]
+    global_member_rate: Dict[str, float]
+
+
 def init_baseline_maps() -> BaselineMaps:
     return BaselineMaps(defaultdict(Counter), defaultdict(Counter), defaultdict(Counter), Counter())
+
+
+def build_calibration_maps(transitions_df: pd.DataFrame) -> CalibrationMaps:
+    winners = transitions_df[transitions_df["next_member"].apply(lambda x: normalize_member_code(x) is not None)].copy()
+    if len(winners) == 0:
+        return CalibrationMaps(stream_member_rate={}, global_member_rate={m: 1 / 3 for m in CORE025})
+    winners["winner_norm"] = winners["next_member"].apply(normalize_member_code)
+    global_counts = winners["winner_norm"].value_counts().to_dict()
+    global_total = max(1, int(sum(global_counts.values())))
+    global_member_rate = {m: global_counts.get(m, 0) / global_total for m in CORE025}
+    stream_member_rate: Dict[str, Dict[str, float]] = {}
+    for stream_id, g in winners.groupby("stream_id", sort=False):
+        counts = g["winner_norm"].value_counts().to_dict()
+        total = max(1, int(sum(counts.values())))
+        stream_member_rate[stream_id] = {m: counts.get(m, 0) / total for m in CORE025}
+    return CalibrationMaps(stream_member_rate=stream_member_rate, global_member_rate=global_member_rate)
 
 
 def add_transition_to_maps(maps: BaselineMaps, row: pd.Series) -> None:
@@ -505,32 +527,53 @@ def apply_separator_rules(row: pd.Series, rules: List[Dict[str, object]], params
     return boosts, fired_counts
 
 
-def rank_members_from_maps(row: pd.Series, maps: BaselineMaps, separator_rules: List[Dict[str, object]], params: Dict[str, float]) -> Dict[str, object]:
+def apply_member_calibration(base_scores: Dict[str, float], boosts: Dict[str, float], fired_counts: Dict[str, int], stream_id: str, calibration_maps: CalibrationMaps, params: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    adjusted = {m: base_scores[m] + boosts[m] for m in CORE025}
+    diagnostics: Dict[str, float] = {}
+    global_rates = calibration_maps.global_member_rate
+    stream_rates = calibration_maps.stream_member_rate.get(stream_id, global_rates)
+    total_rules = max(1, sum(fired_counts.values()))
+    max_boost = max(1e-9, max(boosts.values()) if boosts else 0.0)
+
+    for m in CORE025:
+        calibration = 1.0
+        stream_bias = stream_rates.get(m, global_rates.get(m, 1 / 3)) - global_rates.get(m, 1 / 3)
+        calibration += float(params[f"cal_{m}_stream_bias_weight"]) * stream_bias
+        calibration += float(params[f"cal_{m}_global_bias_weight"]) * (global_rates.get(m, 1 / 3) - (1 / 3))
+        calibration += float(params[f"cal_{m}_rule_align_weight"]) * (fired_counts[m] / total_rules)
+        calibration += float(params[f"cal_{m}_boost_align_weight"]) * (boosts[m] / max_boost if max_boost > 0 else 0.0)
+        calibration = max(float(params["calibration_floor"]), min(float(params["calibration_cap"]), calibration))
+        adjusted[m] *= calibration
+        diagnostics[f"calibration_{m}"] = calibration
+        diagnostics[f"stream_rate_{m}"] = stream_rates.get(m, global_rates.get(m, 1 / 3))
+        diagnostics[f"global_rate_{m}"] = global_rates.get(m, 1 / 3)
+    return adjusted, diagnostics
+
+
+def rank_members_from_maps(row: pd.Series, maps: BaselineMaps, separator_rules: List[Dict[str, object]], params: Dict[str, float], calibration_maps: CalibrationMaps) -> Dict[str, object]:
     base = baseline_scores_from_maps(row, maps, int(params["min_stream_history"]))
     boosts, fired_counts = apply_separator_rules(row, separator_rules, params)
+    calibrated_scores, calibration_diag = apply_member_calibration(base, boosts, fired_counts, str(row["stream_id"]), calibration_maps, params)
 
-    # V8 Top1 separation: sharpen leader only after evidence exists, without altering skip.
     separation_pressure = float(params["top1_separation_pressure"])
     top1_commit_gap = float(params["top1_commit_gap"])
     top1_commit_ratio_max = float(params["top1_commit_ratio_max"])
     top2_ratio_trigger = float(params["top2_ratio_trigger"])
     top2_gap_trigger = float(params["top2_gap_trigger"])
 
-    scores = {m: base[m] + boosts[m] for m in CORE025}
+    scores = dict(calibrated_scores)
     first_pass = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     fp_top1, fp_s1 = first_pass[0]
     fp_top2, fp_s2 = first_pass[1]
     fp_gap = fp_s1 - fp_s2
     fp_ratio = (fp_s2 / fp_s1) if fp_s1 > 0 else 1.0
 
-    # Confidence proxies from rules + boosts
     total_rule_fires = max(1, sum(fired_counts.values()))
     top1_rule_share = fired_counts[fp_top1] / total_rule_fires
     total_boost = max(1e-9, sum(boosts.values()))
     top1_boost_share = boosts[fp_top1] / total_boost if total_boost > 0 else 0.0
     top1_confidence = 0.55 * top1_rule_share + 0.45 * top1_boost_share
 
-    # Sharpen decisive leaders; penalize indecisive leader just enough to avoid false Top1 inflation.
     if fp_gap >= top1_commit_gap or (fp_ratio <= top1_commit_ratio_max and top1_confidence >= 0.52):
         scores[fp_top1] *= (1.0 + separation_pressure)
     elif fp_ratio >= max(0.90, top2_ratio_trigger - 0.01) and fp_gap <= max(0.10, top2_gap_trigger + 0.02):
@@ -580,6 +623,7 @@ def rank_members_from_maps(row: pd.Series, maps: BaselineMaps, separator_rules: 
         "top1_boost_share": top1_boost_share_final,
         "top1_confidence": confidence,
         "top1_rule_gap": rule_gap,
+        **calibration_diag,
     }
 
 
@@ -602,6 +646,7 @@ def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str,
     main_history = prepare_history(history_df)
     last24_history = prepare_history(last24_df) if last24_df is not None else None
     transitions_full = build_transition_events(main_history)
+    calibration_maps = build_calibration_maps(transitions_full)
     skip_pack = train_skip_engine(transitions_full, params)
     current_df = current_seed_rows(main_history, last24_history)
     current_scored_df = score_current_streams(current_df, skip_pack["history_scored_df"], skip_pack["negative_traits_df"], int(params["skip_top_negative_traits_to_use"]), float(skip_pack["chosen_cutoff"]))
@@ -612,7 +657,7 @@ def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str,
     playlist_rows = []
     surv_merge = survivors.merge(current_df, on=["stream_id", "jurisdiction", "game", "seed_date", "seed"], how="left")
     for _, row in surv_merge.iterrows():
-        ranked = rank_members_from_maps(row, maps, separator_rules, params)
+        ranked = rank_members_from_maps(row, maps, separator_rules, params, calibration_maps)
         playlist_rows.append({"stream": row["stream_id"], "seed": row["seed"], "skip_score": row["skip_score"], **ranked})
     playlist_df = pd.DataFrame(playlist_rows).sort_values(["Top1_score", "top1_confidence", "gap", "ratio"], ascending=[False, False, False, True]).reset_index(drop=True) if playlist_rows else pd.DataFrame()
     return {
@@ -629,6 +674,7 @@ def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str,
 def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dict[str, object]], params: Dict[str, float], progress_bar=None, status_box=None) -> Dict[str, pd.DataFrame]:
     main_history = prepare_history(history_df)
     transitions_full = build_transition_events(main_history).sort_values(["event_date", "stream_id", "seed"]).reset_index(drop=True)
+    calibration_maps = build_calibration_maps(transitions_full)
 
     train_on_core025_only = bool(params.get("lab_train_skip_on_core025_only", False))
     skip_train_df = transitions_full.copy()
@@ -686,7 +732,7 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
             add_transition_to_maps(maps, current)
             continue
 
-        ranked = rank_members_from_maps(current, maps, separator_rules, params)
+        ranked = rank_members_from_maps(current, maps, separator_rules, params, calibration_maps)
         play_mode = ranked["play_mode"]
         top1_win = int(play_mode == "PLAY_TOP1" and ranked["Top1"] == winner_member)
         top2_win = int(play_mode == "PLAY_TOP2" and (ranked["Top1"] == winner_member or ranked["Top2"] == winner_member))
@@ -767,6 +813,7 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         skip_target_retention_pct = st.slider("Skip target hit retention", min_value=0.50, max_value=1.00, value=0.7500, step=0.0001)
         use_locked_skip_cutoff = st.checkbox("Use locked standalone skip cutoff (0.515465)", value=True)
         lab_train_skip_on_core025_only = st.checkbox("LAB: train skip on Core025-only winner transitions", value=False)
+
         st.header("Step 2 Member settings")
         min_stream_history = st.number_input("Minimum stream history for baseline fallback", min_value=0, value=20, step=5)
         per_rule_cap = st.slider("Per-rule cap", min_value=0.10, max_value=5.00, value=2.50, step=0.05)
@@ -785,6 +832,23 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         top1_confidence_min = st.slider("Top1 confidence minimum", min_value=0.00, max_value=1.00, value=0.56, step=0.01)
         top1_min_rule_gap = st.number_input("Top1 minimum rule gap", min_value=0, max_value=10, value=1, step=1)
         top1_ratio_soft_max = st.slider("Top1 soft max ratio", min_value=0.50, max_value=1.00, value=0.90, step=0.01)
+
+        st.header("V9 member calibration")
+        calibration_floor = st.slider("Calibration floor", min_value=0.50, max_value=1.00, value=0.80, step=0.01)
+        calibration_cap = st.slider("Calibration cap", min_value=1.00, max_value=1.50, value=1.20, step=0.01)
+        cal_0025_stream_bias_weight = st.slider("0025 stream-bias weight", min_value=-1.00, max_value=1.00, value=-0.05, step=0.01)
+        cal_0025_global_bias_weight = st.slider("0025 global-bias weight", min_value=-1.00, max_value=1.00, value=-0.06, step=0.01)
+        cal_0025_rule_align_weight = st.slider("0025 rule-align weight", min_value=0.00, max_value=1.00, value=0.10, step=0.01)
+        cal_0025_boost_align_weight = st.slider("0025 boost-align weight", min_value=0.00, max_value=1.00, value=0.08, step=0.01)
+        cal_0225_stream_bias_weight = st.slider("0225 stream-bias weight", min_value=-1.00, max_value=1.00, value=0.00, step=0.01)
+        cal_0225_global_bias_weight = st.slider("0225 global-bias weight", min_value=-1.00, max_value=1.00, value=0.02, step=0.01)
+        cal_0225_rule_align_weight = st.slider("0225 rule-align weight", min_value=0.00, max_value=1.00, value=0.12, step=0.01)
+        cal_0225_boost_align_weight = st.slider("0225 boost-align weight", min_value=0.00, max_value=1.00, value=0.10, step=0.01)
+        cal_0255_stream_bias_weight = st.slider("0255 stream-bias weight", min_value=-1.00, max_value=1.00, value=0.05, step=0.01)
+        cal_0255_global_bias_weight = st.slider("0255 global-bias weight", min_value=-1.00, max_value=1.00, value=0.06, step=0.01)
+        cal_0255_rule_align_weight = st.slider("0255 rule-align weight", min_value=0.00, max_value=1.00, value=0.14, step=0.01)
+        cal_0255_boost_align_weight = st.slider("0255 boost-align weight", min_value=0.00, max_value=1.00, value=0.12, step=0.01)
+
         rows_to_show = st.number_input("Rows to display", min_value=5, value=50, step=5)
         lab_max_events = st.number_input("LAB max events (0 = all)", min_value=0, value=250, step=50)
     return locals()
@@ -817,9 +881,9 @@ def main() -> None:
         if st.button("Run Combined Daily Pipeline", type="primary"):
             with st.spinner("Running Step 1 skip + Step 2 ranking..."):
                 out = combined_daily_run(hist_df, separator_rules, params, last24_df)
-                st.session_state["combined_daily_out_v8"] = out
-        if "combined_daily_out_v8" in st.session_state:
-            out = st.session_state["combined_daily_out_v8"]
+                st.session_state["combined_daily_out_v9"] = out
+        if "combined_daily_out_v9" in st.session_state:
+            out = st.session_state["combined_daily_out_v9"]
             st.subheader("Step 1 current stream scoring")
             st.dataframe(out["current_scored_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Generated play_survivors.csv")
@@ -828,9 +892,9 @@ def main() -> None:
             st.dataframe(out["playlist_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Skip cutoff used")
             st.dataframe(out["skip_chosen_cutoff_df"], use_container_width=True)
-            st.download_button("Download play_survivors__2026-04-03_v8.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v8.csv", mime="text/csv")
-            st.download_button("Download final_ranked_playlist__2026-04-03_v8.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v8.csv", mime="text/csv")
-            st.download_button("Download skip_current_scored__2026-04-03_v8.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v8.csv", mime="text/csv")
+            st.download_button("Download play_survivors__2026-04-03_v9.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v9.csv", mime="text/csv")
+            st.download_button("Download final_ranked_playlist__2026-04-03_v9.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v9.csv", mime="text/csv")
+            st.download_button("Download skip_current_scored__2026-04-03_v9.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v9.csv", mime="text/csv")
     else:
         if st.button("Run Combined Walk-Forward LAB", type="primary"):
             with st.spinner("Running combined no-lookahead walk-forward..."):
@@ -838,9 +902,9 @@ def main() -> None:
                 status_box = st.empty()
                 out = combined_walkforward_lab(hist_df, separator_rules, params, progress_bar=progress, status_box=status_box)
                 progress.empty()
-                st.session_state["combined_lab_out_v8"] = out
-        if "combined_lab_out_v8" in st.session_state:
-            out = st.session_state["combined_lab_out_v8"]
+                st.session_state["combined_lab_out_v9"] = out
+        if "combined_lab_out_v9" in st.session_state:
+            out = st.session_state["combined_lab_out_v9"]
             st.subheader("Combined summary")
             st.dataframe(out["summary"], use_container_width=True)
             st.subheader("Per-event")
@@ -849,10 +913,10 @@ def main() -> None:
             st.dataframe(out["per_date"].head(rows_to_show), use_container_width=True)
             st.subheader("Per-stream")
             st.dataframe(out["per_stream"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download combined_lab_per_event__2026-04-03_v8.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v8.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_date__2026-04-03_v8.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v8.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_stream__2026-04-03_v8.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v8.csv", mime="text/csv")
-            st.download_button("Download combined_lab_summary__2026-04-03_v8.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v8.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_event__2026-04-03_v9.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v9.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_date__2026-04-03_v9.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v9.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_stream__2026-04-03_v9.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v9.csv", mime="text/csv")
+            st.download_button("Download combined_lab_summary__2026-04-03_v9.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v9.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
