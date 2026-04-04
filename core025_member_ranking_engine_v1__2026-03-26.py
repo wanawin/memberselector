@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# core025_skip_plus_v14_combined_lab__2026-04-03_v6.py
+# core025_skip_plus_v14_combined_lab__2026-04-03_v7.py
 #
-# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v6
+# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v7
 #
 # Full file. No placeholders.
 #
@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v6"
+BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v7"
 CORE025 = ["0025", "0225", "0255"]
 CORE025_SET = set(CORE025)
 DIGITS = list(range(10))
@@ -368,20 +368,29 @@ def score_current_streams(current_df: pd.DataFrame, history_scored_df: pd.DataFr
         fired_traits.append(" | ".join(fired))
     work["skip_fire_count"] = fire_counts
     work["fired_skip_traits"] = fired_traits
+
     stream_hist = history_scored_df.groupby("stream_id")["next_is_core025_hit"].mean().rename("stream_hit_rate")
     stream_hist_recent = history_scored_df.groupby("stream_id")["recent_50_hit_rate_before_event"].mean().rename("stream_recent50")
     work = work.merge(stream_hist, on="stream_id", how="left")
     work = work.merge(stream_hist_recent, on="stream_id", how="left")
-    work["trait_fire_pct"] = percentile_rank_series(work["skip_fire_count"].fillna(0))
-    work["stream_negative_pct"] = percentile_rank_series(1 - work["stream_hit_rate"].fillna(history_scored_df["next_is_core025_hit"].mean()))
-    work["recent50_negative_pct"] = percentile_rank_series(1 - work["stream_recent50"].fillna(history_scored_df["recent_50_hit_rate_before_event"].mean()))
+
+    # V7 fix: use training-based normalization for current scoring instead of
+    # percentile ranking inside the current batch, which collapses to 1.0 when
+    # current_df has very few rows (especially one row during walk-forward).
+    max_train_fire = float(max(1.0, history_scored_df["skip_fire_count"].max())) if len(history_scored_df) else 1.0
+    fallback_hit_rate = float(history_scored_df["next_is_core025_hit"].mean()) if len(history_scored_df) else 0.0
+    fallback_recent50 = float(history_scored_df["recent_50_hit_rate_before_event"].mean()) if len(history_scored_df) else 0.0
+
+    work["trait_fire_pct"] = (work["skip_fire_count"].fillna(0).astype(float) / max_train_fire).clip(lower=0, upper=1)
+    work["stream_negative_pct"] = (1 - work["stream_hit_rate"].fillna(fallback_hit_rate).astype(float)).clip(lower=0, upper=1)
+    work["recent50_negative_pct"] = (1 - work["stream_recent50"].fillna(fallback_recent50).astype(float)).clip(lower=0, upper=1)
     work["skip_score"] = (
         0.50 * work["trait_fire_pct"].fillna(0)
         + 0.30 * work["stream_negative_pct"].fillna(0)
         + 0.20 * work["recent50_negative_pct"].fillna(0)
     ).clip(lower=0, upper=1)
     work["skip_class"] = np.where(work["skip_score"] >= float(chosen_skip_score_cutoff), "SKIP", "PLAY")
-    out = work[["stream_id", "jurisdiction", "game", "seed_date", "seed", "skip_fire_count", "fired_skip_traits", "skip_score", "skip_class"]].copy()
+    out = work[["stream_id", "jurisdiction", "game", "seed_date", "seed", "skip_fire_count", "fired_skip_traits", "trait_fire_pct", "stream_negative_pct", "recent50_negative_pct", "skip_score", "skip_class"]].copy()
     return dedupe_columns(out.sort_values(["skip_score", "skip_fire_count"], ascending=[False, False]).reset_index(drop=True))
 
 
@@ -798,9 +807,9 @@ def main() -> None:
         if st.button("Run Combined Daily Pipeline", type="primary"):
             with st.spinner("Running Step 1 skip + Step 2 ranking..."):
                 out = combined_daily_run(hist_df, separator_rules, params, last24_df)
-                st.session_state["combined_daily_out_v6"] = out
-        if "combined_daily_out_v6" in st.session_state:
-            out = st.session_state["combined_daily_out_v6"]
+                st.session_state["combined_daily_out_v7"] = out
+        if "combined_daily_out_v7" in st.session_state:
+            out = st.session_state["combined_daily_out_v7"]
             st.subheader("Step 1 current stream scoring")
             st.dataframe(out["current_scored_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Generated play_survivors.csv")
@@ -809,9 +818,9 @@ def main() -> None:
             st.dataframe(out["playlist_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Skip cutoff used")
             st.dataframe(out["skip_chosen_cutoff_df"], use_container_width=True)
-            st.download_button("Download play_survivors__2026-04-03_v6.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v6.csv", mime="text/csv")
-            st.download_button("Download final_ranked_playlist__2026-04-03_v6.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v6.csv", mime="text/csv")
-            st.download_button("Download skip_current_scored__2026-04-03_v6.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v6.csv", mime="text/csv")
+            st.download_button("Download play_survivors__2026-04-03_v7.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v7.csv", mime="text/csv")
+            st.download_button("Download final_ranked_playlist__2026-04-03_v7.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v7.csv", mime="text/csv")
+            st.download_button("Download skip_current_scored__2026-04-03_v7.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v7.csv", mime="text/csv")
     else:
         if st.button("Run Combined Walk-Forward LAB", type="primary"):
             with st.spinner("Running combined no-lookahead walk-forward..."):
@@ -819,9 +828,9 @@ def main() -> None:
                 status_box = st.empty()
                 out = combined_walkforward_lab(hist_df, separator_rules, params, progress_bar=progress, status_box=status_box)
                 progress.empty()
-                st.session_state["combined_lab_out_v6"] = out
-        if "combined_lab_out_v6" in st.session_state:
-            out = st.session_state["combined_lab_out_v6"]
+                st.session_state["combined_lab_out_v7"] = out
+        if "combined_lab_out_v7" in st.session_state:
+            out = st.session_state["combined_lab_out_v7"]
             st.subheader("Combined summary")
             st.dataframe(out["summary"], use_container_width=True)
             st.subheader("Per-event")
@@ -830,10 +839,10 @@ def main() -> None:
             st.dataframe(out["per_date"].head(rows_to_show), use_container_width=True)
             st.subheader("Per-stream")
             st.dataframe(out["per_stream"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download combined_lab_per_event__2026-04-03_v6.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v6.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_date__2026-04-03_v6.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v6.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_stream__2026-04-03_v6.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v6.csv", mime="text/csv")
-            st.download_button("Download combined_lab_summary__2026-04-03_v6.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v6.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_event__2026-04-03_v7.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v7.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_date__2026-04-03_v7.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v7.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_stream__2026-04-03_v7.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v7.csv", mime="text/csv")
+            st.download_button("Download combined_lab_summary__2026-04-03_v7.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v7.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
