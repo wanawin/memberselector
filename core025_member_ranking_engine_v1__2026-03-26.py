@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# core025_skip_plus_v14_combined_lab__2026-04-03_v3.py
+# core025_skip_plus_v14_combined_lab__2026-04-03_v4.py
 #
-# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v3
+# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v4
 #
 # Full file. No placeholders.
 #
@@ -44,7 +44,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v3"
+BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v4"
 CORE025 = ["0025", "0225", "0255"]
 CORE025_SET = set(CORE025)
 DIGITS = list(range(10))
@@ -854,9 +854,14 @@ def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str,
 def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dict[str, object]], params: Dict[str, float], progress_bar=None, status_box=None) -> Dict[str, pd.DataFrame]:
     main_history = prepare_history(history_df)
     transitions_all = build_transition_events(main_history).sort_values(["event_date", "stream_id", "seed"]).reset_index(drop=True)
+
+    # V4 fix: only cap AFTER restricting to scorable Core025 winner events,
+    # and cap from the most recent side so the LAB sample is meaningful.
+    scorable_transitions = transitions_all[transitions_all["next_member"].apply(lambda x: normalize_member_code(x) is not None)].copy().reset_index(drop=True)
     max_lab_events = int(params.get("lab_max_events", 0))
-    if max_lab_events > 0 and len(transitions_all) > max_lab_events:
-        transitions_all = transitions_all.head(max_lab_events).copy().reset_index(drop=True)
+    if max_lab_events > 0 and len(scorable_transitions) > max_lab_events:
+        scorable_transitions = scorable_transitions.tail(max_lab_events).copy().reset_index(drop=True)
+    transitions_all = scorable_transitions
     total_events_to_process = len(transitions_all)
 
     # V3: train Step 1 skip engine ONCE on the full transition set, then reuse it for all events.
@@ -946,9 +951,13 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
     per_event = pd.DataFrame(rows)
     if len(per_event) == 0:
         if status_box is not None:
-            status_box.warning("Combined walk-forward produced no scored events.")
+            status_box.warning("Combined walk-forward produced no scored events. Check whether the uploaded history contains any Core025 winners in the selected LAB window.")
         empty = pd.DataFrame()
-        return {"per_event": empty, "per_date": empty, "per_stream": empty, "summary": pd.DataFrame()}
+        summary = pd.DataFrame([
+            {"metric": "events", "value": 0},
+            {"metric": "reason", "value": "No Core025 winner events in selected LAB window"},
+        ])
+        return {"per_event": empty, "per_date": empty, "per_stream": empty, "summary": summary}
 
     per_date = per_event.groupby("event_date", dropna=False).agg(
         events=("event_id", "count"),
@@ -1074,18 +1083,18 @@ def main():
         if st.button("Run Combined Daily Pipeline", type="primary"):
             with st.spinner("Running Step 1 skip + Step 2 V14..."):
                 out = combined_daily_run(hist_df, separator_rules, params, last24_df)
-                st.session_state["combined_daily_out_v3"] = out
-        if "combined_daily_out_v3" in st.session_state:
-            out = st.session_state["combined_daily_out_v3"]
+                st.session_state["combined_daily_out_v4"] = out
+        if "combined_daily_out_v4" in st.session_state:
+            out = st.session_state["combined_daily_out_v4"]
             st.subheader("Step 1 current stream scoring")
             st.dataframe(out["current_scored_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Generated play_survivors.csv")
             st.dataframe(out["play_survivors_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Step 2 final playlist")
             st.dataframe(out["playlist_df"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download play_survivors__2026-04-03_v3.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v3.csv", mime="text/csv")
-            st.download_button("Download final_ranked_playlist__2026-04-03_v3.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v3.csv", mime="text/csv")
-            st.download_button("Download skip_current_scored__2026-04-03_v3.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v3.csv", mime="text/csv")
+            st.download_button("Download play_survivors__2026-04-03_v4.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v4.csv", mime="text/csv")
+            st.download_button("Download final_ranked_playlist__2026-04-03_v4.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v4.csv", mime="text/csv")
+            st.download_button("Download skip_current_scored__2026-04-03_v4.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v4.csv", mime="text/csv")
     else:
         if st.button("Run Combined Walk-Forward LAB", type="primary"):
             with st.spinner("Running combined no-lookahead walk-forward..."):
@@ -1093,9 +1102,9 @@ def main():
                 status_box = st.empty()
                 out = combined_walkforward_lab(hist_df, separator_rules, params, progress_bar=progress, status_box=status_box)
                 progress.empty()
-                st.session_state["combined_lab_out_v3"] = out
-        if "combined_lab_out_v3" in st.session_state:
-            out = st.session_state["combined_lab_out_v3"]
+                st.session_state["combined_lab_out_v4"] = out
+        if "combined_lab_out_v4" in st.session_state:
+            out = st.session_state["combined_lab_out_v4"]
             st.subheader("Combined summary")
             st.dataframe(out["summary"], use_container_width=True)
             st.subheader("Per-event")
@@ -1104,10 +1113,10 @@ def main():
             st.dataframe(out["per_date"].head(rows_to_show), use_container_width=True)
             st.subheader("Per-stream")
             st.dataframe(out["per_stream"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download combined_lab_per_event__2026-04-03_v3.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v3.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_date__2026-04-03_v3.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v3.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_stream__2026-04-03_v3.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v3.csv", mime="text/csv")
-            st.download_button("Download combined_lab_summary__2026-04-03_v3.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v3.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_event__2026-04-03_v4.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v4.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_date__2026-04-03_v4.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v4.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_stream__2026-04-03_v4.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v4.csv", mime="text/csv")
+            st.download_button("Download combined_lab_summary__2026-04-03_v4.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v4.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
