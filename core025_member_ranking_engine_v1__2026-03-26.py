@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-# core025_skip_plus_v14_combined_lab__2026-04-03_v4.py
+# core025_skip_plus_v14_combined_lab__2026-04-03_v5.py
 #
-# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v4
+# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v5
 #
 # Full file. No placeholders.
 #
 # Purpose
 # -------
 # Combined Step 1 Skip Engine + V14 Member Engine in one app.
+#
+# V5 restores the standalone Step 1 skip ladder behavior as closely as possible:
+# - min trait support = 12
+# - top negative traits = 15
+# - ladder rungs = 50
+# - target retention = 0.75
+# - optional locked standalone cutoff = 0.515465 (default ON)
 #
 # This file supports two production uses:
 # 1) Daily Combined Run:
@@ -21,7 +28,8 @@
 #
 # 2) Combined Walk-Forward LAB:
 #    - no-lookahead test of Step 1 + Step 2 together
-#    - uses only prior history at each event
+#    - uses only prior history at each event for Step 2 member ranking
+#    - Step 1 skip behavior restored to standalone defaults / locked cutoff mode
 #    - reports skip retention, survivors, Top1 wins, Top2 wins, Top3 losses
 #      using the user's locked scoring definitions
 #
@@ -37,14 +45,13 @@ import io
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v4"
+BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v5"
 CORE025 = ["0025", "0225", "0255"]
 CORE025_SET = set(CORE025)
 DIGITS = list(range(10))
@@ -269,7 +276,6 @@ def feature_dict(seed: str) -> Dict[str, object]:
 
 def prepare_history(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = dedupe_columns(df_raw.copy())
-
     if len(df.columns) == 4:
         c0, c1, c2, c3 = list(df.columns)
         df = df.rename(columns={c0: "date", c1: "jurisdiction", c2: "game", c3: "result_raw"})
@@ -293,7 +299,6 @@ def prepare_history(df_raw: pd.DataFrame) -> pd.DataFrame:
 def build_transition_events(history_df: pd.DataFrame) -> pd.DataFrame:
     sort_df = history_df.sort_values(["stream_id", "date_dt", "file_order"], ascending=[True, True, False]).copy()
     rows: List[Dict[str, object]] = []
-
     for stream_id, g in sort_df.groupby("stream_id", sort=False):
         g = g.reset_index(drop=True)
         if len(g) < 2:
@@ -303,12 +308,10 @@ def build_transition_events(history_df: pd.DataFrame) -> pd.DataFrame:
         for i in range(1, len(g)):
             prev_row = g.iloc[i - 1]
             cur_row = g.iloc[i]
-
             last_hit_before_prev = past_hit_positions[-1] if len(past_hit_positions) > 0 else None
             current_gap_before_event = (i - 1 - last_hit_before_prev) if last_hit_before_prev is not None else i
             last50 = g.iloc[max(0, i - 50):i]
             recent_50_hit_rate = float(last50["is_core025_hit"].mean()) if len(last50) else 0.0
-
             rows.append({
                 "stream_id": stream_id,
                 "jurisdiction": cur_row["jurisdiction"],
@@ -323,7 +326,6 @@ def build_transition_events(history_df: pd.DataFrame) -> pd.DataFrame:
                 "current_gap_before_event": int(current_gap_before_event),
                 "recent_50_hit_rate_before_event": recent_50_hit_rate,
             })
-
             if int(cur_row["is_core025_hit"]) == 1:
                 past_hit_positions.append(i)
 
@@ -342,13 +344,13 @@ def current_seed_rows(history_df: pd.DataFrame, last24_history: Optional[pd.Data
     latest = latest.reset_index(drop=True)
     out = pd.concat([
         latest[["stream_id", "jurisdiction", "game", "date_dt", "result4"]].rename(columns={"date_dt": "seed_date", "result4": "seed"}),
-        feat_df
+        feat_df,
     ], axis=1)
     return dedupe_columns(out)
 
 
 # -----------------------------------------------------------------------------
-# Step 1 Skip Engine
+# Step 1 Skip Engine (restored standalone behavior)
 # -----------------------------------------------------------------------------
 
 def mine_negative_traits(df: pd.DataFrame, min_support: int) -> pd.DataFrame:
@@ -356,7 +358,7 @@ def mine_negative_traits(df: pd.DataFrame, min_support: int) -> pd.DataFrame:
     base_rate = float(df["next_is_core025_hit"].mean())
     candidate_cols = [
         "sum", "spread", "even", "high", "unique", "pair", "max_rep", "pos1", "pos2", "pos3", "pos4",
-        "consec_links", "mirrorpair_cnt"
+        "consec_links", "mirrorpair_cnt",
     ] + [f"has{k}" for k in DIGITS] + [f"cnt{k}" for k in DIGITS]
 
     for col in candidate_cols:
@@ -420,9 +422,9 @@ def build_skip_score_table(feat_df: pd.DataFrame, negative_traits_df: pd.DataFra
     work["stream_negative_pct"] = percentile_rank_series(1 - work.groupby("stream_id")["next_is_core025_hit"].transform("mean"))
     work["recent50_negative_pct"] = percentile_rank_series(1 - work["recent_50_hit_rate_before_event"].fillna(0))
     work["skip_score"] = (
-        0.50 * work["trait_fire_pct"].fillna(0) +
-        0.30 * work["stream_negative_pct"].fillna(0) +
-        0.20 * work["recent50_negative_pct"].fillna(0)
+        0.50 * work["trait_fire_pct"].fillna(0)
+        + 0.30 * work["stream_negative_pct"].fillna(0)
+        + 0.20 * work["recent50_negative_pct"].fillna(0)
     ).clip(lower=0, upper=1)
     return dedupe_columns(work)
 
@@ -433,6 +435,7 @@ def build_retention_ladder(scored_df: pd.DataFrame, rung_count: int) -> pd.DataF
     total_hits = int(df["next_is_core025_hit"].sum())
     if total_events == 0:
         return pd.DataFrame()
+
     cutoffs = np.linspace(0, total_events, int(rung_count) + 1, dtype=int)[1:]
     rows: List[Dict[str, object]] = []
     for rank_cut in cutoffs:
@@ -496,9 +499,9 @@ def score_current_streams(current_df: pd.DataFrame, history_scored_df: pd.DataFr
     work["stream_negative_pct"] = percentile_rank_series(1 - work["stream_hit_rate"].fillna(history_scored_df["next_is_core025_hit"].mean()))
     work["recent50_negative_pct"] = percentile_rank_series(1 - work["stream_recent50"].fillna(history_scored_df["recent_50_hit_rate_before_event"].mean()))
     work["skip_score"] = (
-        0.50 * work["trait_fire_pct"].fillna(0) +
-        0.30 * work["stream_negative_pct"].fillna(0) +
-        0.20 * work["recent50_negative_pct"].fillna(0)
+        0.50 * work["trait_fire_pct"].fillna(0)
+        + 0.30 * work["stream_negative_pct"].fillna(0)
+        + 0.20 * work["recent50_negative_pct"].fillna(0)
     ).clip(lower=0, upper=1)
     work["skip_class"] = np.where(work["skip_score"] >= float(chosen_skip_score_cutoff), "SKIP", "PLAY")
     out = work[["stream_id", "jurisdiction", "game", "seed_date", "seed", "skip_fire_count", "fired_skip_traits", "skip_score", "skip_class"]].copy()
@@ -506,13 +509,13 @@ def score_current_streams(current_df: pd.DataFrame, history_scored_df: pd.DataFr
     return dedupe_columns(out)
 
 
-def run_skip_training(main_history: pd.DataFrame, min_trait_support: int, top_negative_traits_to_use: int, rung_count: int, target_retention_pct: float) -> Dict[str, object]:
+def run_skip_training(main_history: pd.DataFrame, min_trait_support: int, top_negative_traits_to_use: int, rung_count: int, target_retention_pct: float, use_locked_skip_cutoff: bool = True) -> Dict[str, object]:
     transitions_df = build_transition_events(main_history)
     negative_traits_df = mine_negative_traits(transitions_df, min_support=int(min_trait_support))
     scored_df = build_skip_score_table(transitions_df, negative_traits_df, int(top_negative_traits_to_use))
     ladder_df = build_retention_ladder(scored_df, int(rung_count))
     recommended_df = recommend_cutoff(ladder_df, float(target_retention_pct))
-    chosen_cutoff = float(recommended_df.iloc[0]["max_skip_score_included"]) if len(recommended_df) else 1.0
+    chosen_cutoff = DEFAULT_SKIP_SCORE_CUTOFF if bool(use_locked_skip_cutoff) else (float(recommended_df.iloc[0]["max_skip_score_included"]) if len(recommended_df) else 1.0)
     return {
         "transitions_df": transitions_df,
         "negative_traits_df": negative_traits_df,
@@ -683,7 +686,12 @@ def compress_member_scores(base_scores: Dict[str, float], boosts: Dict[str, floa
     for m in CORE025:
         delta = pre_scores[m] - mean_score
         compressed[m] = mean_score + (delta * compression_factor)
-    diagnostics = {"compression_factor": compression_factor, "exclusivity_strength": exclusivity_strength, "rule_gap_top12": float(rule_gap), "boost_gap_top12": float(boost_gap)}
+    diagnostics = {
+        "compression_factor": compression_factor,
+        "exclusivity_strength": exclusivity_strength,
+        "rule_gap_top12": float(rule_gap),
+        "boost_gap_top12": float(boost_gap),
+    }
     return compressed, diagnostics
 
 
@@ -693,7 +701,11 @@ def compute_alignment(top1_rule_count: int, top2_rule_count: int, top1_boost: fl
     rule_alignment_ratio = float(top1_rule_count) / float(total_rules)
     boost_alignment_ratio = float(top1_boost) / float(total_boost)
     blended_alignment_ratio = (rule_alignment_ratio * 0.50) + (boost_alignment_ratio * 0.50)
-    return {"rule_alignment_ratio": rule_alignment_ratio, "boost_alignment_ratio": boost_alignment_ratio, "blended_alignment_ratio": blended_alignment_ratio}
+    return {
+        "rule_alignment_ratio": rule_alignment_ratio,
+        "boost_alignment_ratio": boost_alignment_ratio,
+        "blended_alignment_ratio": blended_alignment_ratio,
+    }
 
 
 def apply_member_score_calibration(scores: Dict[str, float], member_alignment: Dict[str, float], member_boost_gap: Dict[str, float], m0025_penalty_top2_score_min: float, m0025_penalty_alignment_max: float, m0025_penalty_multiplier_top2: float, m0025_penalty_multiplier_align: float, m0225_boost_alignment_min: float, m0225_boost_multiplier: float, m0255_boost_gap_min: float, m0255_boost_alignment_min: float, m0255_boost_multiplier_gap: float, m0255_boost_multiplier_align: float) -> Dict[str, float]:
@@ -715,7 +727,13 @@ def apply_member_score_calibration(scores: Dict[str, float], member_alignment: D
 
 
 def classify_dominance_state(gap: float, ratio: float, exclusivity_strength: float, rule_gap_top12: float, blended_alignment_ratio: float, dominant_gap_strict: float, dominant_ratio_max_strict: float, dominant_exclusivity_min: float, dominant_rule_gap_min: float, dominant_alignment_min: float, contested_gap_max: float, contested_ratio_min: float) -> str:
-    if (gap >= float(dominant_gap_strict) and ratio <= float(dominant_ratio_max_strict) and exclusivity_strength >= float(dominant_exclusivity_min) and rule_gap_top12 >= float(dominant_rule_gap_min) and blended_alignment_ratio >= float(dominant_alignment_min)):
+    if (
+        gap >= float(dominant_gap_strict)
+        and ratio <= float(dominant_ratio_max_strict)
+        and exclusivity_strength >= float(dominant_exclusivity_min)
+        and rule_gap_top12 >= float(dominant_rule_gap_min)
+        and blended_alignment_ratio >= float(dominant_alignment_min)
+    ):
         return "DOMINANT"
     if gap >= 0.55 and blended_alignment_ratio >= 0.58:
         return "DOMINANT"
@@ -805,13 +823,30 @@ def rank_members_from_maps(row: pd.Series, maps: BaselineMaps, separator_rules: 
     dominance_state = classify_dominance_state(gap, ratio, float(compression_diag["exclusivity_strength"]), float(compression_diag["rule_gap_top12"]), float(alignment_diag["blended_alignment_ratio"]), float(params["dominant_gap_strict"]), float(params["dominant_ratio_max_strict"]), float(params["dominant_exclusivity_min"]), float(params["dominant_rule_gap_min"]), float(params["dominant_alignment_min"]), float(params["contested_gap_max"]), float(params["contested_ratio_min"]))
     play_mode, play_reason = decide_play_mode(top1, top1_score, top2_score, gap, ratio, float(compression_diag["exclusivity_strength"]), float(compression_diag["boost_gap_top12"]), float(alignment_diag["blended_alignment_ratio"]), dominance_state, float(params["weak_top1_score_floor"]), float(params["top2_ratio_trigger"]), float(params["top2_gap_trigger"]), float(params["top2_alignment_ceiling"]), float(params["top2_exclusivity_ceiling"]), float(params["m0025_boost_gap_min"]), float(params["m0025_alignment_min"]), float(params["m0025_top2_score_max"]), float(params["m0225_boost_gap_min"]), float(params["m0225_alignment_min"]), float(params["m0225_ratio_max"]), float(params["m0255_boost_gap_min"]), float(params["m0255_alignment_min"]), float(params["m0255_gap_min"]))
     return {
-        "Top1": top1, "Top1_score": top1_score, "Top2": top2, "Top2_score": top2_score, "Top3": top3, "Top3_score": top3_score,
-        "gap": gap, "ratio": ratio, "play_mode": play_mode, "play_reason": play_reason, "dominance_state": dominance_state,
-        "compression_factor": compression_diag["compression_factor"], "exclusivity_strength": compression_diag["exclusivity_strength"],
-        "rule_gap_top12": compression_diag["rule_gap_top12"], "boost_gap_top12": compression_diag["boost_gap_top12"],
-        "rule_alignment_ratio": alignment_diag["rule_alignment_ratio"], "boost_alignment_ratio": alignment_diag["boost_alignment_ratio"], "blended_alignment_ratio": alignment_diag["blended_alignment_ratio"],
-        "member_alignment_0025": member_alignment.get("0025", 0.0), "member_alignment_0225": member_alignment.get("0225", 0.0), "member_alignment_0255": member_alignment.get("0255", 0.0),
-        "member_boost_gap_0025": member_boost_gap.get("0025", 0.0), "member_boost_gap_0225": member_boost_gap.get("0225", 0.0), "member_boost_gap_0255": member_boost_gap.get("0255", 0.0),
+        "Top1": top1,
+        "Top1_score": top1_score,
+        "Top2": top2,
+        "Top2_score": top2_score,
+        "Top3": top3,
+        "Top3_score": top3_score,
+        "gap": gap,
+        "ratio": ratio,
+        "play_mode": play_mode,
+        "play_reason": play_reason,
+        "dominance_state": dominance_state,
+        "compression_factor": compression_diag["compression_factor"],
+        "exclusivity_strength": compression_diag["exclusivity_strength"],
+        "rule_gap_top12": compression_diag["rule_gap_top12"],
+        "boost_gap_top12": compression_diag["boost_gap_top12"],
+        "rule_alignment_ratio": alignment_diag["rule_alignment_ratio"],
+        "boost_alignment_ratio": alignment_diag["boost_alignment_ratio"],
+        "blended_alignment_ratio": alignment_diag["blended_alignment_ratio"],
+        "member_alignment_0025": member_alignment.get("0025", 0.0),
+        "member_alignment_0225": member_alignment.get("0225", 0.0),
+        "member_alignment_0255": member_alignment.get("0255", 0.0),
+        "member_boost_gap_0025": member_boost_gap.get("0025", 0.0),
+        "member_boost_gap_0225": member_boost_gap.get("0225", 0.0),
+        "member_boost_gap_0255": member_boost_gap.get("0255", 0.0),
     }
 
 
@@ -822,7 +857,14 @@ def rank_members_from_maps(row: pd.Series, maps: BaselineMaps, separator_rules: 
 def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str, object]], params: Dict[str, float], last24_df: Optional[pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     main_history = prepare_history(history_df)
     last24_history = prepare_history(last24_df) if last24_df is not None else None
-    skip_pack = run_skip_training(main_history, int(params["skip_min_trait_support"]), int(params["skip_top_negative_traits_to_use"]), int(params["skip_rung_count"]), float(params["skip_target_retention_pct"]))
+    skip_pack = run_skip_training(
+        main_history,
+        int(params["skip_min_trait_support"]),
+        int(params["skip_top_negative_traits_to_use"]),
+        int(params["skip_rung_count"]),
+        float(params["skip_target_retention_pct"]),
+        bool(params["use_locked_skip_cutoff"]),
+    )
     current_df = current_seed_rows(main_history, last24_history)
     current_scored_df = score_current_streams(current_df, skip_pack["history_scored_df"], skip_pack["negative_traits_df"], int(params["skip_top_negative_traits_to_use"]), float(skip_pack["chosen_cutoff"]))
     survivors = current_scored_df[current_scored_df["skip_class"] == "PLAY"].copy().reset_index(drop=True)
@@ -837,7 +879,10 @@ def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str,
     for _, row in surv_merge.iterrows():
         ranked = rank_members_from_maps(row, maps, separator_rules, params)
         playlist_rows.append({
-            "stream": row["stream_id"], "seed": row["seed"], "skip_score": row["skip_score"], "skip_fire_count": row["skip_fire_count"],
+            "stream": row["stream_id"],
+            "seed": row["seed"],
+            "skip_score": row["skip_score"],
+            "skip_fire_count": row["skip_fire_count"],
             **ranked,
         })
     playlist_df = pd.DataFrame(playlist_rows).sort_values(["Top1_score", "gap", "ratio"], ascending=[False, False, True]).reset_index(drop=True) if len(playlist_rows) else pd.DataFrame()
@@ -848,6 +893,7 @@ def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str,
         "skip_negative_traits_df": skip_pack["negative_traits_df"],
         "skip_ladder_df": skip_pack["ladder_df"],
         "skip_recommended_df": skip_pack["recommended_df"],
+        "skip_chosen_cutoff_df": pd.DataFrame([{"skip_cutoff": skip_pack["chosen_cutoff"], "locked_cutoff_mode": bool(params["use_locked_skip_cutoff"])}]),
     }
 
 
@@ -855,8 +901,6 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
     main_history = prepare_history(history_df)
     transitions_all = build_transition_events(main_history).sort_values(["event_date", "stream_id", "seed"]).reset_index(drop=True)
 
-    # V4 fix: only cap AFTER restricting to scorable Core025 winner events,
-    # and cap from the most recent side so the LAB sample is meaningful.
     scorable_transitions = transitions_all[transitions_all["next_member"].apply(lambda x: normalize_member_code(x) is not None)].copy().reset_index(drop=True)
     max_lab_events = int(params.get("lab_max_events", 0))
     if max_lab_events > 0 and len(scorable_transitions) > max_lab_events:
@@ -864,12 +908,11 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
     transitions_all = scorable_transitions
     total_events_to_process = len(transitions_all)
 
-    # V3: train Step 1 skip engine ONCE on the full transition set, then reuse it for all events.
     negative_traits_df = mine_negative_traits(transitions_all, min_support=int(params["skip_min_trait_support"]))
     history_scored_df = build_skip_score_table(transitions_all, negative_traits_df, int(params["skip_top_negative_traits_to_use"]))
     ladder_df = build_retention_ladder(history_scored_df, int(params["skip_rung_count"]))
     recommended_df = recommend_cutoff(ladder_df, float(params["skip_target_retention_pct"]))
-    chosen_cutoff = float(recommended_df.iloc[0]["max_skip_score_included"]) if len(recommended_df) else 1.0
+    chosen_cutoff = DEFAULT_SKIP_SCORE_CUTOFF if bool(params.get("use_locked_skip_cutoff", True)) else (float(recommended_df.iloc[0]["max_skip_score_included"]) if len(recommended_df) else 1.0)
 
     maps = init_baseline_maps()
     rows = []
@@ -887,13 +930,7 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
             continue
 
         current_seed = pd.DataFrame([{c: current[c] for c in current.index}])
-        current_skip = score_current_streams(
-            current_seed.rename(columns={"event_date": "seed_date"}),
-            history_scored_df,
-            negative_traits_df,
-            int(params["skip_top_negative_traits_to_use"]),
-            chosen_cutoff,
-        )
+        current_skip = score_current_streams(current_seed.rename(columns={"event_date": "seed_date"}), history_scored_df, negative_traits_df, int(params["skip_top_negative_traits_to_use"]), chosen_cutoff)
         skip_class = str(current_skip.iloc[0]["skip_class"])
         skip_score = float(current_skip.iloc[0]["skip_score"])
         skip_fire_count = int(current_skip.iloc[0]["skip_fire_count"])
@@ -909,7 +946,9 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
                 "step1_skip_score": skip_score,
                 "step1_skip_fire_count": skip_fire_count,
                 "survived_step1": 0,
-                "Top1": "", "Top2": "", "Top3": "",
+                "Top1": "",
+                "Top2": "",
+                "Top3": "",
                 "play_mode": "SKIPPED_BY_STEP1",
                 "top1_win": 0,
                 "top2_win": 0,
@@ -987,6 +1026,7 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
         {"metric": "avg_step1_skip_score", "value": float(per_event["step1_skip_score"].mean())},
         {"metric": "avg_survivors_per_day", "value": float(per_date["survivors"].mean())},
         {"metric": "trained_skip_cutoff", "value": float(chosen_cutoff)},
+        {"metric": "locked_cutoff_mode", "value": int(bool(params.get("use_locked_skip_cutoff", True)))},
     ])
     if status_box is not None:
         status_box.success(f"Combined walk-forward completed: {len(per_event):,} scored events.")
@@ -1003,10 +1043,11 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         mode = st.radio("Mode", ["Combined Daily Run", "Combined Walk-Forward LAB"], index=0)
 
         st.header("Step 1 Skip settings")
-        skip_min_trait_support = st.number_input("Skip min trait support", min_value=1, value=6, step=1)
-        skip_top_negative_traits_to_use = st.number_input("Skip top negative traits to use", min_value=1, value=12, step=1)
-        skip_rung_count = st.number_input("Skip ladder rung count", min_value=5, value=25, step=5)
-        skip_target_retention_pct = st.slider("Skip target hit retention", min_value=0.50, max_value=1.00, value=0.7628, step=0.0001)
+        skip_min_trait_support = st.number_input("Skip min trait support", min_value=1, value=12, step=1)
+        skip_top_negative_traits_to_use = st.number_input("Skip top negative traits to use", min_value=1, value=15, step=1)
+        skip_rung_count = st.number_input("Skip ladder rung count", min_value=5, value=50, step=5)
+        skip_target_retention_pct = st.slider("Skip target hit retention", min_value=0.50, max_value=1.00, value=0.7500, step=0.0001)
+        use_locked_skip_cutoff = st.checkbox("Use locked standalone skip cutoff (0.515465)", value=True)
 
         st.header("V14 member settings")
         min_stream_history = st.number_input("Minimum stream history for baseline fallback", min_value=0, value=20, step=5)
@@ -1051,6 +1092,7 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         weak_top1_score_floor = st.slider("Weak Top1 score floor", min_value=0.00, max_value=5.00, value=0.20, step=0.01)
         rows_to_show = st.number_input("Rows to display", min_value=5, value=50, step=5)
         lab_max_events = st.number_input("LAB max events (0 = all)", min_value=0, value=250, step=50)
+
     return locals()
 
 
@@ -1083,18 +1125,20 @@ def main():
         if st.button("Run Combined Daily Pipeline", type="primary"):
             with st.spinner("Running Step 1 skip + Step 2 V14..."):
                 out = combined_daily_run(hist_df, separator_rules, params, last24_df)
-                st.session_state["combined_daily_out_v4"] = out
-        if "combined_daily_out_v4" in st.session_state:
-            out = st.session_state["combined_daily_out_v4"]
+                st.session_state["combined_daily_out_v5"] = out
+        if "combined_daily_out_v5" in st.session_state:
+            out = st.session_state["combined_daily_out_v5"]
             st.subheader("Step 1 current stream scoring")
             st.dataframe(out["current_scored_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Generated play_survivors.csv")
             st.dataframe(out["play_survivors_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Step 2 final playlist")
             st.dataframe(out["playlist_df"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download play_survivors__2026-04-03_v4.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v4.csv", mime="text/csv")
-            st.download_button("Download final_ranked_playlist__2026-04-03_v4.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v4.csv", mime="text/csv")
-            st.download_button("Download skip_current_scored__2026-04-03_v4.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v4.csv", mime="text/csv")
+            st.subheader("Skip cutoff used")
+            st.dataframe(out["skip_chosen_cutoff_df"], use_container_width=True)
+            st.download_button("Download play_survivors__2026-04-03_v5.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v5.csv", mime="text/csv")
+            st.download_button("Download final_ranked_playlist__2026-04-03_v5.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v5.csv", mime="text/csv")
+            st.download_button("Download skip_current_scored__2026-04-03_v5.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v5.csv", mime="text/csv")
     else:
         if st.button("Run Combined Walk-Forward LAB", type="primary"):
             with st.spinner("Running combined no-lookahead walk-forward..."):
@@ -1102,9 +1146,9 @@ def main():
                 status_box = st.empty()
                 out = combined_walkforward_lab(hist_df, separator_rules, params, progress_bar=progress, status_box=status_box)
                 progress.empty()
-                st.session_state["combined_lab_out_v4"] = out
-        if "combined_lab_out_v4" in st.session_state:
-            out = st.session_state["combined_lab_out_v4"]
+                st.session_state["combined_lab_out_v5"] = out
+        if "combined_lab_out_v5" in st.session_state:
+            out = st.session_state["combined_lab_out_v5"]
             st.subheader("Combined summary")
             st.dataframe(out["summary"], use_container_width=True)
             st.subheader("Per-event")
@@ -1113,10 +1157,10 @@ def main():
             st.dataframe(out["per_date"].head(rows_to_show), use_container_width=True)
             st.subheader("Per-stream")
             st.dataframe(out["per_stream"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download combined_lab_per_event__2026-04-03_v4.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v4.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_date__2026-04-03_v4.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v4.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_stream__2026-04-03_v4.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v4.csv", mime="text/csv")
-            st.download_button("Download combined_lab_summary__2026-04-03_v4.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v4.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_event__2026-04-03_v5.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v5.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_date__2026-04-03_v5.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v5.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_stream__2026-04-03_v5.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v5.csv", mime="text/csv")
+            st.download_button("Download combined_lab_summary__2026-04-03_v5.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v5.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
