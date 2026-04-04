@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-# core025_skip_plus_v14_combined_lab__2026-04-03_v7.py
+# core025_skip_plus_v14_combined_lab__2026-04-03_v8.py
 #
-# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v7
+# BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v8
 #
 # Full file. No placeholders.
 #
 # Combined Step 1 Skip Engine + Step 2 V14-like Core025 member engine.
 #
-# V6 fix:
-# - In Combined Walk-Forward LAB, Step 1 skip training can now be run on either:
-#   * FULL transition set (hits + misses)  [default; correct for skip training]
-#   * Core025-only winner transitions       [optional experimental mode]
-# - This matches the old standalone app behavior where that restriction could be
-#   toggled on/off in LAB.
+# V8 = Top1 separation upgrade
+# - keeps v7 skip-distribution fix
+# - keeps v6 skip-training toggle behavior
+# - strengthens Top1 commitment only inside Step 2 member separation
+# - reduces unnecessary Top2 widening
+# - adds explicit confidence diagnostics so Top1/Top2 decisions can be audited
 #
 # Locked scoring definitions:
 # - Top1 win = only Top1 was played and Top1 won
@@ -31,16 +31,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v7"
+BUILD_MARKER = "BUILD: core025_skip_plus_v14_combined_lab__2026-04-03_v8"
 CORE025 = ["0025", "0225", "0255"]
 CORE025_SET = set(CORE025)
 DIGITS = list(range(10))
 DEFAULT_SKIP_SCORE_CUTOFF = 0.515465
 
-
-# -----------------------------------------------------------------------------
-# generic helpers
-# -----------------------------------------------------------------------------
 
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     seen: Dict[str, int] = {}
@@ -147,10 +143,6 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return dedupe_columns(df).to_csv(index=False).encode("utf-8")
 
 
-# -----------------------------------------------------------------------------
-# features / history prep
-# -----------------------------------------------------------------------------
-
 def feature_dict(seed: str) -> Dict[str, object]:
     d = [int(ch) for ch in str(seed)]
     cnt = Counter(d)
@@ -248,10 +240,6 @@ def current_seed_rows(history_df: pd.DataFrame, last24_history: Optional[pd.Data
     ], axis=1)
     return dedupe_columns(out)
 
-
-# -----------------------------------------------------------------------------
-# step 1 skip ladder
-# -----------------------------------------------------------------------------
 
 def mine_negative_traits(df: pd.DataFrame, min_support: int) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
@@ -374,9 +362,6 @@ def score_current_streams(current_df: pd.DataFrame, history_scored_df: pd.DataFr
     work = work.merge(stream_hist, on="stream_id", how="left")
     work = work.merge(stream_hist_recent, on="stream_id", how="left")
 
-    # V7 fix: use training-based normalization for current scoring instead of
-    # percentile ranking inside the current batch, which collapses to 1.0 when
-    # current_df has very few rows (especially one row during walk-forward).
     max_train_fire = float(max(1.0, history_scored_df["skip_fire_count"].max())) if len(history_scored_df) else 1.0
     fallback_hit_rate = float(history_scored_df["next_is_core025_hit"].mean()) if len(history_scored_df) else 0.0
     fallback_recent50 = float(history_scored_df["recent_50_hit_rate_before_event"].mean()) if len(history_scored_df) else 0.0
@@ -390,13 +375,12 @@ def score_current_streams(current_df: pd.DataFrame, history_scored_df: pd.DataFr
         + 0.20 * work["recent50_negative_pct"].fillna(0)
     ).clip(lower=0, upper=1)
     work["skip_class"] = np.where(work["skip_score"] >= float(chosen_skip_score_cutoff), "SKIP", "PLAY")
-    out = work[["stream_id", "jurisdiction", "game", "seed_date", "seed", "skip_fire_count", "fired_skip_traits", "trait_fire_pct", "stream_negative_pct", "recent50_negative_pct", "skip_score", "skip_class"]].copy()
+    out = work[[
+        "stream_id", "jurisdiction", "game", "seed_date", "seed", "skip_fire_count", "fired_skip_traits",
+        "trait_fire_pct", "stream_negative_pct", "recent50_negative_pct", "skip_score", "skip_class"
+    ]].copy()
     return dedupe_columns(out.sort_values(["skip_score", "skip_fire_count"], ascending=[False, False]).reset_index(drop=True))
 
-
-# -----------------------------------------------------------------------------
-# step 2 separator / ranking
-# -----------------------------------------------------------------------------
 
 def parse_trait_stack(stack_text: str) -> List[Tuple[str, str]]:
     parts = [p.strip() for p in str(stack_text).split("&&") if p.strip()]
@@ -524,25 +508,66 @@ def apply_separator_rules(row: pd.Series, rules: List[Dict[str, object]], params
 def rank_members_from_maps(row: pd.Series, maps: BaselineMaps, separator_rules: List[Dict[str, object]], params: Dict[str, float]) -> Dict[str, object]:
     base = baseline_scores_from_maps(row, maps, int(params["min_stream_history"]))
     boosts, fired_counts = apply_separator_rules(row, separator_rules, params)
+
+    # V8 Top1 separation: sharpen leader only after evidence exists, without altering skip.
+    separation_pressure = float(params["top1_separation_pressure"])
+    top1_commit_gap = float(params["top1_commit_gap"])
+    top1_commit_ratio_max = float(params["top1_commit_ratio_max"])
+    top2_ratio_trigger = float(params["top2_ratio_trigger"])
+    top2_gap_trigger = float(params["top2_gap_trigger"])
+
     scores = {m: base[m] + boosts[m] for m in CORE025}
+    first_pass = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    fp_top1, fp_s1 = first_pass[0]
+    fp_top2, fp_s2 = first_pass[1]
+    fp_gap = fp_s1 - fp_s2
+    fp_ratio = (fp_s2 / fp_s1) if fp_s1 > 0 else 1.0
+
+    # Confidence proxies from rules + boosts
+    total_rule_fires = max(1, sum(fired_counts.values()))
+    top1_rule_share = fired_counts[fp_top1] / total_rule_fires
+    total_boost = max(1e-9, sum(boosts.values()))
+    top1_boost_share = boosts[fp_top1] / total_boost if total_boost > 0 else 0.0
+    top1_confidence = 0.55 * top1_rule_share + 0.45 * top1_boost_share
+
+    # Sharpen decisive leaders; penalize indecisive leader just enough to avoid false Top1 inflation.
+    if fp_gap >= top1_commit_gap or (fp_ratio <= top1_commit_ratio_max and top1_confidence >= 0.52):
+        scores[fp_top1] *= (1.0 + separation_pressure)
+    elif fp_ratio >= max(0.90, top2_ratio_trigger - 0.01) and fp_gap <= max(0.10, top2_gap_trigger + 0.02):
+        scores[fp_top1] *= 0.97
+
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     top1, s1 = ranked[0]
     top2, s2 = ranked[1]
     top3, s3 = ranked[2]
     gap = s1 - s2
     ratio = (s2 / s1) if s1 > 0 else 1.0
+
+    top1_rules = fired_counts[top1]
+    top2_rules = fired_counts[top2]
+    rule_gap = top1_rules - top2_rules
+    total_rule_fires_final = max(1, sum(fired_counts.values()))
+    top1_rule_share_final = top1_rules / total_rule_fires_final
+    total_boost_final = max(1e-9, sum(boosts.values()))
+    top1_boost_share_final = boosts[top1] / total_boost_final if total_boost_final > 0 else 0.0
+    confidence = 0.55 * top1_rule_share_final + 0.45 * top1_boost_share_final
+
     if s1 < float(params["weak_top1_score_floor"]):
         play_mode = "SKIP"
         reason = "Top1 score too weak"
-    elif gap >= float(params["dominant_gap_strict"]) and ratio <= float(params["dominant_ratio_max_strict"]):
+    elif gap >= top1_commit_gap and ratio <= top1_commit_ratio_max:
         play_mode = "PLAY_TOP1"
-        reason = "Dominant top1"
-    elif ratio >= float(params["top2_ratio_trigger"]) or gap <= float(params["top2_gap_trigger"]):
+        reason = "Strong Top1 commitment"
+    elif confidence >= float(params["top1_confidence_min"]) and rule_gap >= int(params["top1_min_rule_gap"]) and ratio <= float(params["top1_ratio_soft_max"]):
+        play_mode = "PLAY_TOP1"
+        reason = "Confidence-backed Top1"
+    elif ratio >= top2_ratio_trigger or gap <= top2_gap_trigger:
         play_mode = "PLAY_TOP2"
         reason = "Tight top1/top2"
     else:
         play_mode = "PLAY_TOP1"
         reason = "Top1-first default"
+
     return {
         "Top1": top1, "Top1_score": s1,
         "Top2": top2, "Top2_score": s2,
@@ -551,12 +576,12 @@ def rank_members_from_maps(row: pd.Series, maps: BaselineMaps, separator_rules: 
         "play_mode": play_mode, "play_reason": reason,
         "rules_0025": fired_counts["0025"], "rules_0225": fired_counts["0225"], "rules_0255": fired_counts["0255"],
         "boost_0025": boosts["0025"], "boost_0225": boosts["0225"], "boost_0255": boosts["0255"],
+        "top1_rule_share": top1_rule_share_final,
+        "top1_boost_share": top1_boost_share_final,
+        "top1_confidence": confidence,
+        "top1_rule_gap": rule_gap,
     }
 
-
-# -----------------------------------------------------------------------------
-# combined runs
-# -----------------------------------------------------------------------------
 
 def train_skip_engine(transitions_df: pd.DataFrame, params: Dict[str, float]) -> Dict[str, object]:
     negative_traits_df = mine_negative_traits(transitions_df, min_support=int(params["skip_min_trait_support"]))
@@ -589,7 +614,7 @@ def combined_daily_run(history_df: pd.DataFrame, separator_rules: List[Dict[str,
     for _, row in surv_merge.iterrows():
         ranked = rank_members_from_maps(row, maps, separator_rules, params)
         playlist_rows.append({"stream": row["stream_id"], "seed": row["seed"], "skip_score": row["skip_score"], **ranked})
-    playlist_df = pd.DataFrame(playlist_rows).sort_values(["Top1_score", "gap", "ratio"], ascending=[False, False, True]).reset_index(drop=True) if playlist_rows else pd.DataFrame()
+    playlist_df = pd.DataFrame(playlist_rows).sort_values(["Top1_score", "top1_confidence", "gap", "ratio"], ascending=[False, False, False, True]).reset_index(drop=True) if playlist_rows else pd.DataFrame()
     return {
         "current_scored_df": current_scored_df,
         "play_survivors_df": survivors,
@@ -605,7 +630,6 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
     main_history = prepare_history(history_df)
     transitions_full = build_transition_events(main_history).sort_values(["event_date", "stream_id", "seed"]).reset_index(drop=True)
 
-    # V6 fix: explicit toggle to train Step 1 on full dataset or winner-only subset.
     train_on_core025_only = bool(params.get("lab_train_skip_on_core025_only", False))
     skip_train_df = transitions_full.copy()
     if train_on_core025_only:
@@ -621,16 +645,12 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
     total_events_to_process = len(score_events)
     maps = init_baseline_maps()
     rows = []
-    for _, tr in transitions_full.iterrows():
-        # maps are built incrementally inside scoring loop only for earlier events
-        break
-    event_lookup = {tuple(row[['event_date','stream_id','seed']]): idx for idx, row in score_events.iterrows()}
+    event_lookup = {tuple(row[["event_date", "stream_id", "seed"]]): idx for idx, row in score_events.iterrows()}
 
-    # use all transitions in chronological order so step2 remains no-lookahead
-    for idx_full, current in transitions_full.iterrows():
-        key = (current['event_date'], current['stream_id'], current['seed'])
+    for _, current in transitions_full.iterrows():
+        key = (current["event_date"], current["stream_id"], current["seed"])
         in_scored_window = key in event_lookup
-        winner_member = normalize_member_code(current['next_member'])
+        winner_member = normalize_member_code(current["next_member"])
         if not in_scored_window:
             add_transition_to_maps(maps, current)
             continue
@@ -736,10 +756,6 @@ def combined_walkforward_lab(history_df: pd.DataFrame, separator_rules: List[Dic
     return {"per_event": per_event, "per_date": per_date, "per_stream": per_stream, "summary": summary}
 
 
-# -----------------------------------------------------------------------------
-# ui
-# -----------------------------------------------------------------------------
-
 def collect_params_from_sidebar() -> Dict[str, float]:
     with st.sidebar:
         st.markdown(f"**{BUILD_MARKER}**")
@@ -758,23 +774,17 @@ def collect_params_from_sidebar() -> Dict[str, float]:
         diminishing_return_factor = st.slider("Diminishing return factor", min_value=0.00, max_value=3.00, value=0.35, step=0.01)
         rule_count_norm_factor = st.slider("Rule-count normalization factor", min_value=0.00, max_value=3.00, value=1.50, step=0.01)
         max_rules_per_member = st.number_input("Max fired rules per member", min_value=1, max_value=100, value=5, step=1)
-        compression_alpha = st.slider("Base compression alpha", min_value=0.05, max_value=1.00, value=0.45, step=0.01)
-        exclusivity_rule_bonus = st.slider("Exclusivity bonus per rule-gap", min_value=0.00, max_value=0.50, value=0.08, step=0.01)
-        exclusivity_boost_bonus = st.slider("Exclusivity bonus per boost-gap", min_value=0.00, max_value=1.00, value=0.20, step=0.01)
-        exclusivity_cap = st.slider("Exclusivity cap", min_value=0.00, max_value=1.00, value=0.35, step=0.01)
-        min_compression_factor = st.slider("Minimum compression factor", min_value=0.05, max_value=1.00, value=0.30, step=0.01)
         dominant_gap_strict = st.slider("Strict dominant gap threshold", min_value=0.00, max_value=2.00, value=0.65, step=0.01)
         dominant_ratio_max_strict = st.slider("Strict dominant max ratio", min_value=0.50, max_value=1.00, value=0.65, step=0.01)
-        dominant_exclusivity_min = st.slider("Strict dominant min exclusivity", min_value=0.00, max_value=1.00, value=0.24, step=0.01)
-        dominant_rule_gap_min = st.slider("Strict dominant min rule-gap", min_value=0.00, max_value=10.00, value=3.00, step=0.10)
-        dominant_alignment_min = st.slider("Strict dominant min alignment", min_value=0.00, max_value=1.00, value=0.60, step=0.01)
-        contested_gap_max = st.slider("Contested gap max", min_value=0.00, max_value=2.00, value=0.12, step=0.01)
-        contested_ratio_min = st.slider("Contested ratio min", min_value=0.50, max_value=1.00, value=0.97, step=0.01)
-        top2_ratio_trigger = st.slider("Top2 widen ratio trigger", min_value=0.50, max_value=1.00, value=0.97, step=0.01)
-        top2_gap_trigger = st.slider("Top2 widen gap trigger", min_value=0.00, max_value=2.00, value=0.08, step=0.01)
-        top2_alignment_ceiling = st.slider("Top2 widen max alignment", min_value=0.00, max_value=1.00, value=0.62, step=0.01)
-        top2_exclusivity_ceiling = st.slider("Top2 widen max exclusivity", min_value=0.00, max_value=1.00, value=0.22, step=0.01)
+        top2_ratio_trigger = st.slider("Top2 widen ratio trigger", min_value=0.50, max_value=1.00, value=0.98, step=0.01)
+        top2_gap_trigger = st.slider("Top2 widen gap trigger", min_value=0.00, max_value=2.00, value=0.06, step=0.01)
         weak_top1_score_floor = st.slider("Weak Top1 score floor", min_value=0.00, max_value=5.00, value=0.20, step=0.01)
+        top1_separation_pressure = st.slider("Top1 separation pressure", min_value=0.00, max_value=0.50, value=0.12, step=0.01)
+        top1_commit_gap = st.slider("Top1 commit gap", min_value=0.00, max_value=2.00, value=0.45, step=0.01)
+        top1_commit_ratio_max = st.slider("Top1 commit max ratio", min_value=0.50, max_value=1.00, value=0.86, step=0.01)
+        top1_confidence_min = st.slider("Top1 confidence minimum", min_value=0.00, max_value=1.00, value=0.56, step=0.01)
+        top1_min_rule_gap = st.number_input("Top1 minimum rule gap", min_value=0, max_value=10, value=1, step=1)
+        top1_ratio_soft_max = st.slider("Top1 soft max ratio", min_value=0.50, max_value=1.00, value=0.90, step=0.01)
         rows_to_show = st.number_input("Rows to display", min_value=5, value=50, step=5)
         lab_max_events = st.number_input("LAB max events (0 = all)", min_value=0, value=250, step=50)
     return locals()
@@ -807,9 +817,9 @@ def main() -> None:
         if st.button("Run Combined Daily Pipeline", type="primary"):
             with st.spinner("Running Step 1 skip + Step 2 ranking..."):
                 out = combined_daily_run(hist_df, separator_rules, params, last24_df)
-                st.session_state["combined_daily_out_v7"] = out
-        if "combined_daily_out_v7" in st.session_state:
-            out = st.session_state["combined_daily_out_v7"]
+                st.session_state["combined_daily_out_v8"] = out
+        if "combined_daily_out_v8" in st.session_state:
+            out = st.session_state["combined_daily_out_v8"]
             st.subheader("Step 1 current stream scoring")
             st.dataframe(out["current_scored_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Generated play_survivors.csv")
@@ -818,9 +828,9 @@ def main() -> None:
             st.dataframe(out["playlist_df"].head(rows_to_show), use_container_width=True)
             st.subheader("Skip cutoff used")
             st.dataframe(out["skip_chosen_cutoff_df"], use_container_width=True)
-            st.download_button("Download play_survivors__2026-04-03_v7.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v7.csv", mime="text/csv")
-            st.download_button("Download final_ranked_playlist__2026-04-03_v7.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v7.csv", mime="text/csv")
-            st.download_button("Download skip_current_scored__2026-04-03_v7.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v7.csv", mime="text/csv")
+            st.download_button("Download play_survivors__2026-04-03_v8.csv", df_to_csv_bytes(out["play_survivors_df"]), file_name="play_survivors__2026-04-03_v8.csv", mime="text/csv")
+            st.download_button("Download final_ranked_playlist__2026-04-03_v8.csv", df_to_csv_bytes(out["playlist_df"]), file_name="final_ranked_playlist__2026-04-03_v8.csv", mime="text/csv")
+            st.download_button("Download skip_current_scored__2026-04-03_v8.csv", df_to_csv_bytes(out["current_scored_df"]), file_name="skip_current_scored__2026-04-03_v8.csv", mime="text/csv")
     else:
         if st.button("Run Combined Walk-Forward LAB", type="primary"):
             with st.spinner("Running combined no-lookahead walk-forward..."):
@@ -828,9 +838,9 @@ def main() -> None:
                 status_box = st.empty()
                 out = combined_walkforward_lab(hist_df, separator_rules, params, progress_bar=progress, status_box=status_box)
                 progress.empty()
-                st.session_state["combined_lab_out_v7"] = out
-        if "combined_lab_out_v7" in st.session_state:
-            out = st.session_state["combined_lab_out_v7"]
+                st.session_state["combined_lab_out_v8"] = out
+        if "combined_lab_out_v8" in st.session_state:
+            out = st.session_state["combined_lab_out_v8"]
             st.subheader("Combined summary")
             st.dataframe(out["summary"], use_container_width=True)
             st.subheader("Per-event")
@@ -839,10 +849,10 @@ def main() -> None:
             st.dataframe(out["per_date"].head(rows_to_show), use_container_width=True)
             st.subheader("Per-stream")
             st.dataframe(out["per_stream"].head(rows_to_show), use_container_width=True)
-            st.download_button("Download combined_lab_per_event__2026-04-03_v7.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v7.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_date__2026-04-03_v7.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v7.csv", mime="text/csv")
-            st.download_button("Download combined_lab_per_stream__2026-04-03_v7.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v7.csv", mime="text/csv")
-            st.download_button("Download combined_lab_summary__2026-04-03_v7.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v7.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_event__2026-04-03_v8.csv", df_to_csv_bytes(out["per_event"]), file_name="combined_lab_per_event__2026-04-03_v8.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_date__2026-04-03_v8.csv", df_to_csv_bytes(out["per_date"]), file_name="combined_lab_per_date__2026-04-03_v8.csv", mime="text/csv")
+            st.download_button("Download combined_lab_per_stream__2026-04-03_v8.csv", df_to_csv_bytes(out["per_stream"]), file_name="combined_lab_per_stream__2026-04-03_v8.csv", mime="text/csv")
+            st.download_button("Download combined_lab_summary__2026-04-03_v8.csv", df_to_csv_bytes(out["summary"]), file_name="combined_lab_summary__2026-04-03_v8.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
